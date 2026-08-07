@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hyphal Network 3D Visualization</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; }
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            color: white;
+            font-family: sans-serif;
+        }
+        button { margin: 5px; }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <div>
+            <button id="playPause">Play</button>
+            <button id="reset">Reset</button>
+        </div>
+        <div>
+            Time: <span id="timeDisplay">0</span> ms
+            <input type="range" id="timeSlider" min="0" max="1000" step="0.5" value="0" style="width: 200px;">
+        </div>
+        <div>
+            Speed: <span id="speedDisplay">1.0</span>×
+            <input type="range" id="speedSlider" min="0.1" max="10" step="0.1" value="1" style="width: 200px;">
+        </div>
+    </div>
+    <div id="rasterContainer">
+        <div id="rasterResize" title="Drag to resize, double‑click to toggle"></div>
+        <div id="rasterScrollbar">
+            <div id="rasterScrollThumb"></div>
+        </div>
+        <canvas id="rasterCanvas"></canvas>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
+
+<style>
+#rasterContainer {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 200px; /* default */
+    background: rgba(0, 0, 0, 0.7);
+    pointer-events: auto;
+    user-select: none;
+}
+#rasterResize {
+    width: 100%;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.5);
+    cursor: ns-resize;
+    position: absolute;
+    top: 0;
+    z-index: 10;
+}
+#rasterCanvas {
+    width: 100%;
+    height: calc(100% - 4px);
+    display: block;
+    cursor: grab;
+}
+#rasterCanvas:active {
+    cursor: grabbing;
+}
+#rasterScrollbar {
+    position: absolute;
+    right: 0;
+    top: 4px;
+    width: 10px;
+    height: calc(100% - 4px);
+    z-index: 5;
+    display: none; /* hidden by default, shown when needed */
+}
+#rasterScrollThumb {
+    width: 8px;
+    margin: 0 1px;
+    background: rgba(255, 255, 255, 0.3);
+    border-radius: 4px;
+    position: absolute;
+    top: 0;
+    cursor: pointer;
+}
+</style>
