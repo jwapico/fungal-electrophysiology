@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Optional, Tuple, Callable
+from classification import fit_single_waveform, GMMClassifier
 from pathlib import Path
 import numpy as np
 import matplotlib
@@ -263,8 +264,6 @@ def process_channel(data: np.ndarray, channel: int,
     window_sizes = []
     spike_indices_valid = []
     
-    # lazy import yikes im lazy
-    from classification import fit_single_waveform, GMMClassifier
     for spike_idx in peak_indices:
         result = extract_waveform(
             spike_idx, voltage,

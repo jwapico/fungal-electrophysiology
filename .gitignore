@@ -369,3 +369,4 @@ vite.config.ts.timestamp-*
 simulation_data.json
 package-lock.json
 outputs/
+fungi-signaling/outputs*

@@ -18,7 +18,6 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-import seaborn as sns
 
 # ML libraries
 from sklearn.decomposition import PCA
