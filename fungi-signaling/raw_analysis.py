@@ -1,27 +1,49 @@
 """
-raw_analysis.py  (rev 3 - event-based)
+raw_analysis.py  (rev 4 - event-based, timestamped runs, tile grid)
 
-Replaces per-peak spike detection with EVENT segmentation:
+Pipeline for MEA compound-event waveform extraction (fungal recordings).
 
-  - noise floor via robust estimator (MAD default: the low envelope gate must
-    not be inflated by the very events we are segmenting - on ch40 std=8.7uV
-    inflates the gate to 52uV and truncates the small envelope oscillations,
-    while MAD=2.9uV keeps them)
-  - envelope gate: contiguous |voltage| > gate  ->  excursion
-  - excursions separated by <= EVENT_GAP_MS are merged into ONE event
-  - an event is kept only if its dominant |deflection| exceeds the spike gate
-  - window = [onset - pre_pad, offset + post_pad], clamped to
-    [MIN_WINDOW_MS, MAX_WINDOW_MS]; oversized events are centered on the
-    dominant peak
+Each channel k of the recording v_k (in microvolts) is segmented into
+multi-oscillation "events" and one waveform window is extracted per event:
 
-Each event yields one waveform window spanning the WHOLE oscillatory event
-(variable number of oscillations), aligned on the dominant peak.
+  1. Robust noise floor:    sigma_k = 1.4826 * median |v_k - median(v_k)|
+     (MAD; 1.4826 = 1 / Phi^{-1}(3/4) so sigma_k = sigma for Gaussian noise).
+     The low envelope gate must not be inflated by the very events being
+     segmented, hence MAD (robust) rather than std (inflated by events).
+  2. Envelope gate:         b[n] = 1{|v_k[n]| >= G * sigma_k},  G = EVENT_GATE_SCALE.
+  3. Excursions:            maximal runs [s_j, e_j] with b == 1.
+  4. Gap merge:             runs with s_{j+1} - e_j - 1 <= tau_gap become ONE event
+                            (tau_gap = EVENT_GAP_MS = 5 ms) -> events [S_i, E_i].
+  5. Event gate:            keep i iff duration >= MIN_EVENT_MS  AND
+                            |v_k[m_i]| >= S * sigma_k  (S = SPIKE_GATE_SCALE),
+                            m_i = argmax_{[S_i,E_i]} |v_k|  (dominant deflection).
+  6. Oscillation count:     #peaks of |v_k| on [S_i,E_i] above the gate, with
+                            >= OSCILLATION_MIN_DISTANCE (1 ms) between peaks.
+  7. Window:                W_i = clip((E_i+p_post) - (S_i-p_pre) + 1,
+                            MIN_WINDOW_MS, MAX_WINDOW_MS); if clipped, centered
+                            on m_i; clamped to trace bounds. Peak offset
+                            r_i = m_i - start_i.
+
+Output layout: each run writes into its own timestamped directory
+   outputs/<YYYY-MM-DD_HH-MM-SS>/
+     waveforms/waveforms.npz        (persisted events, one row per channel)
+     html/waveforms_grid.html       (flex CSS grid of per-event tiles)
+     html/all_ch_spikes.html        (full per-channel traces with events)
+     html/interactive_ch_views/channel_N_interactive.html  (click-to-zoom)
+     run_meta.json                  (parameters + per-channel summary)
+
+Run from the project root:
+    python raw_analysis.py
+    python raw_analysis.py --data-file <path>
+    python raw_analysis.py -o outputs/<ts>/waveforms/waveforms.npz -v   # re-render
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import io
+import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
@@ -42,10 +64,18 @@ BINARY_DTYPE: str = "int16"
 
 RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_control_0_cut800s.bin"
 
-WAVEFORM_OUTPUT_FILE: str = "outputs/waveforms/waveforms.npz"
-SPIKE_HTML_OUTPUT_FILE: str = "outputs/html/waveforms_grid.html"
-CHANNEL_HTML_OUTPUT_FILE: str = "outputs/html/all_ch_spikes.html"
+# --------------------------------------------------------------------------
+# output layout (every run gets its own timestamped directory so iterations
+# can be tracked; -v re-renders a previous run's .npz in place)
+# --------------------------------------------------------------------------
+OUTPUT_ROOT: str = "outputs"
+TIMESTAMP_FORMAT: str = "%Y-%m-%d_%H-%M-%S"
+WAVEFORM_REL_PATH: str = "waveforms/waveforms.npz"
+SPIKE_HTML_REL_PATH: str = "html/waveforms_grid.html"
+CHANNEL_HTML_REL_PATH: str = "html/all_ch_spikes.html"
 INTERACTIVE_HTML_PATTERN: str = "channel_{ch}_interactive.html"
+INTERACTIVE_HTML_DIR: str = "interactive_ch_views"
+RUN_META_FILENAME: str = "run_meta.json"
 PLOTLY_JS: str = "cdn"
 
 # ---------------- event segmentation ----------------
@@ -68,6 +98,7 @@ CHANNEL_DS_FACTOR: int = 10
 MAX_WAVEFORMS_PER_CHANNEL: int = 200
 WAVEFORMS_PER_ROW: int = 6
 FIGURE_DPI: int = 80
+TILE_DPI: int = 120          # dpi of the per-event grid tiles
 TRACE_DPI: int = 100
 RANDOM_SEED: int = 0
 
@@ -85,6 +116,15 @@ class Event(NamedTuple):
 
 
 def load_raw_data(filepath: str) -> np.ndarray:
+    """Load interleaved int16 MEA binary as a memmap of shape (T, 64).
+
+    The raw file stores sample y[n] for the interleaved stream; the channel
+    index is k = n mod 64, the time index is t = n // 64. Reshaping the flat
+    array into (-1, NUM_CHANNELS) de-interleaves it in one step:
+        Y[t, k] = y[64*t + k],   t = 0..T-1,  k = 0..63.
+    Memory-mapped (no full load) so that 900 s * 30 kHz * 64 * 2 bytes
+    (approx. 3.4 GB) streams through without exhausting RAM.
+    """
     print(f"Loading raw data from: {filepath}")
     raw = np.memmap(filepath, dtype=BINARY_DTYPE, mode="r")
     if raw.size % NUM_CHANNELS != 0:
@@ -98,10 +138,23 @@ def load_raw_data(filepath: str) -> np.ndarray:
 
 
 def estimate_noise_std(x: np.ndarray) -> float:
+    """Classical noise scale:  sigma = sqrt( (1/N) * sum_n (x_n - mean)^2 ).
+
+    Biased upward when large events are present in x (the events are part of
+    the variance), which inflates the gate and truncates event envelopes.
+    """
     return float(np.std(x))
 
 
 def estimate_noise_mad(x: np.ndarray) -> float:
+    """Robust noise scale (median absolute deviation).
+
+        sigma_hat = 1.4826 * median_n |x_n - median_m x_m|
+
+    The constant 1.4826 = 1 / Phi^{-1}(3/4) makes sigma_hat an unbiased
+    estimate of the Gaussian standard deviation sigma, while remaining
+    insensitive to the (rare, large) events that inflate the std.
+    """
     median = float(np.median(x))
     return float(1.4826 * np.median(np.abs(x - median)))
 
@@ -116,7 +169,23 @@ def detect_events(
     osc_min_distance: int = OSCILLATION_MIN_DISTANCE,
     sample_rate: int = SAMPLE_RATE_HZ,
 ) -> Tuple[List[Event], float, float, float]:
-    """Segment the trace into multi-oscillation spike events.
+    """Segment the trace v into multi-oscillation events.
+
+    Formal description
+    ------------------
+    Let sigma = noise_estimator(v), gate = G*sigma, spike_gate = S*sigma.
+
+    1. Excursion set:  E = { n : |v[n]| >= gate }.
+    2. Runs: maximal contiguous intervals [s_j, e_j] within E.
+    3. Merge: run j+1 is joined to run j iff
+           s_{j+1} - e_j - 1 <= gap_samples,   gap_samples = tau_gap * fs/1000
+       producing events [S_i, E_i].
+    4. Event gate: keep i iff
+           (E_i - S_i + 1) >= min_event_samples  AND
+           |v[m_i]| >= spike_gate,   m_i = argmax_{n in [S_i,E_i]} |v[n]|.
+       m_i is the "dominant deflection" (largest |voltage| in the event).
+    5. Oscillation count:  N_i = #{peaks of |v| on [S_i,E_i] with value >= gate
+       and pairwise distance >= osc_min_distance} (rectified-envelope peaks).
 
     Returns:
         (events, noise, gate, spike_gate)
@@ -168,9 +237,27 @@ def extract_event_window(
 ) -> Optional[Tuple[np.ndarray, float, int, int, int]]:
     """Window around a whole event, aligned on the dominant peak.
 
-    Returns:
-        (waveform, event_time_sec, window_samples, window_start_idx, peak_idx)
-        or None if the trace is too short to hold the window.
+    Formal description
+    ------------------
+    Let pre = p_pre*fs/1000, post = p_post*fs/1000, w_min = MIN_WINDOW_MS,
+    w_max = MAX_WINDOW_MS (in samples). The natural window spans
+
+        W_nat = (E_i + post) - (S_i - pre) + 1.
+
+    The extracted size is
+
+        W_i = min(max(W_nat, w_min), w_max),
+
+    and the left edge is
+        start_i = S_i - pre            if w_min <= W_nat <= w_max,
+        start_i = m_i - floor(W_i/2)   if W_nat was clipped
+                                         (centers the window on the
+                                          dominant deflection m_i),
+    then clamped so [start_i, start_i + W_i) lies within the trace.
+
+    Returns (waveform, t_i, W_i, start_i, r_i) with t_i = m_i/fs the event
+    time and r_i = m_i - start_i the peak offset within the window, or None
+    if W_i <= 0.
     """
     pre = int(pre_pad_ms * sample_rate / 1000)
     post = int(post_pad_ms * sample_rate / 1000)
@@ -198,9 +285,21 @@ def extract_event_window(
 
 
 def process_channel(data: np.ndarray, channel: int) -> Dict[str, Any]:
+    """Full per-channel pipeline: detect events, extract one window each.
+
+    For channel k: v_k = data[:, k] * q (q = VOLTAGE_SCALE uV/LSB), then
+    detect_events() + extract_event_window() per event. Persisted features:
+
+      * spike_times    - event time t_i = m_i / fs           (seconds)
+      * window_sizes   - W_i (samples)
+      * peak_indices   - r_i = m_i - start_i (dominant-peak offset in window)
+      * window_starts  - start_i (absolute sample index)
+      * n_oscillations - rectified-envelope peak count N_i
+      * amplitudes     - signed dominant deflection v_k[m_i]  (uV)
+    """
     print(f"\nProcessing channel {channel}...")
     voltage = data[:, channel] * VOLTAGE_SCALE
-    events, noise, gate, spike_gate = detect_events(voltage)
+    events, noise, gate, spike_gate = detect_events(voltage=voltage, noise_estimator=estimate_noise_std)
     print(f"  Found {len(events)} events (gate {gate:.2f} uV, "
           f"spike gate {spike_gate:.2f} uV, noise {noise:.2f} uV)")
 
@@ -246,6 +345,16 @@ def process_channel(data: np.ndarray, channel: int) -> Dict[str, Any]:
 
 def save_waveforms(results: Dict[int, Dict[str, Any]],
                    output_file: str, source_file: str) -> None:
+    """Persist all channels to a single self-describing .npz archive.
+
+    Arrays are stored as N_ch object arrays (one row per channel) because
+    event counts and window lengths vary per channel:
+        waveforms[i] : M_i x W_j  (variable-length rows kept as Python list
+                                    of np.ndarray, boxed in an object array)
+    plus per-channel integer/float arrays (spike_times, window_sizes, ...)
+    and scalar metadata (fs, unit, parameter constants, source file) so the
+    archive is fully self-describing for later analysis (spike_sorting.py).
+    """
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     channels = sorted(results.keys())
@@ -308,6 +417,13 @@ def save_waveforms(results: Dict[int, Dict[str, Any]],
 
 
 def load_waveforms(output_file: str) -> Dict[int, Dict[str, Any]]:
+    """Inverse of save_waveforms(): reconstruct the per-channel dict from .npz.
+
+    Repopulates each channel's "waveforms", "spike_times", "window_sizes",
+    "peak_indices", "window_starts", "n_oscillations", "amplitudes",
+    "threshold", "gate", "std_dev", "n_events", "n_extracted" so a previous
+    run can be re-rendered (-v) without re-reading the raw binary.
+    """
     output_path = Path(output_file)
     if not output_path.exists():
         print(f"Error: Output file does not exist: {output_file}")
@@ -348,8 +464,12 @@ def _html_head(title: str) -> List[str]:
         "border-radius: 8px 8px 0 0; }",
         "        .channel-header h2 { margin: 0 0 10px 0; }",
         "        .stats { font-size: 13px; color: #666; }",
-        "        .channel-section img { max-width: 100%; height: auto; }",
-        "        .channel-section img.grid-img { max-width: none; cursor: pointer; }",
+        "        .tile-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); "
+        "gap: 6px; }",
+        "        .tile { display: block; background: white; border: 1px solid #ddd; "
+        "border-radius: 4px; text-decoration: none; color: inherit; }",
+        "        .tile:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.25); border-color: #888; }",
+        "        .tile img { display: block; width: 100%; height: auto; }",
         "    </style>",
         "</head>", "<body>",
         f"    <h1>{title}</h1>",
@@ -374,25 +494,62 @@ def _figure_to_base64(fig: Figure, dpi: int = FIGURE_DPI,
     return img
 
 
-def _window_time_axis(waveform: np.ndarray,
-                      sample_rate: int = SAMPLE_RATE_HZ) -> np.ndarray:
-    return (np.arange(len(waveform)) - len(waveform) // 2) * (1000.0 / sample_rate)
+def _tile_figure(waveform: np.ndarray, start_idx: int, peak_idx: int,
+                 n_osc: int, sample_rate: int = SAMPLE_RATE_HZ) -> Figure:
+    """Build one small tile figure for a single event window.
+
+    Axes:
+      * x-axis = absolute recording time in seconds, x[n] = (start_idx + n)/fs,
+        so the dominant peak appears at its true recording time t_i = m_i/fs.
+      * y-axis = window voltage (uV), with ticks drawn at the window's min
+        and max values (dashed horizontal lines) so peak-to-peak is read
+        directly off the tile.
+      * "N osc" label in the top-right corner of the axes: the computed
+        oscillation count for manual verification.
+    """
+    fig, ax = plt.subplots(figsize=(1.7, 1.15))
+    t = (start_idx + np.arange(len(waveform))) / sample_rate
+    ax.plot(t, waveform, linewidth=0.7, color="#1f77b4")
+    ax.axvline((start_idx + peak_idx) / sample_rate, color="k",
+               linewidth=0.5, alpha=0.5, linestyle="--")
+    ymin, ymax = float(waveform.min()), float(waveform.max())
+    for yv in (ymin, ymax):
+        ax.axhline(yv, color="#d62728", linewidth=0.4, alpha=0.6, linestyle=":")
+    ax.set_yticks([ymin, ymax])
+    ax.set_yticklabels([f"{ymin:.0f}", f"{ymax:.0f}"], fontsize=5)
+    ax.set_ylim(ymin - 0.05 * (ymax - ymin), ymax + 0.05 * (ymax - ymin))
+    ax.tick_params(labelsize=5, length=2)
+    ax.set_xticks([t[0], t[-1]])
+    ax.set_xticklabels([f"{t[0]:.2f}", f"{t[-1]:.2f}"], fontsize=5)
+    ax.text(0.985, 0.985, f"{n_osc} osc", transform=ax.transAxes,
+            ha="right", va="top", fontsize=6, color="#555")
+    fig.tight_layout(pad=0.15)
+    return fig
 
 
 def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
                             output_file: str,
                             interactive_pattern: str = INTERACTIVE_HTML_PATTERN,
+                            interactive_dir: str = INTERACTIVE_HTML_DIR,
                             max_waveforms: int = MAX_WAVEFORMS_PER_CHANNEL,
-                            per_row: int = WAVEFORMS_PER_ROW,
-                            dpi: int = FIGURE_DPI,
+                            dpi: int = TILE_DPI,
                             context_ms: float = INTERACTIVE_CONTEXT_MS) -> None:
+    """Render the flex CSS-grid of per-event tiles, one tile per waveform.
+
+    Each tile is a small standalone PNG (see _tile_figure) wrapped in an
+    <a> that deep-links to the channel's interactive view zoomed on that
+    event. The grid uses CSS auto-fill so tiles reflow with the browser
+    width (responsive/flex layout); no image maps are needed.
+    """
     print(f"\nGenerating waveform grid HTML: {output_file}")
     rng = np.random.default_rng(RANDOM_SEED)
 
     html_parts = _html_head("MEA Spike Waveform Grid")
     html_parts.append("    <p>Every extracted event window, per channel. "
-                      "Time in ms, centred on the window; the vertical line marks "
-                      "the dominant peak. Click a window to open the channel's "
+                      "x-axis is absolute recording time (s); the red dotted "
+                      "lines mark the window min/max voltage; the dashed line "
+                      "is the dominant peak; the corner number is the computed "
+                      "oscillation count. Click a tile to open the channel's "
                       "interactive view zoomed to that event.</p>")
 
     for ch in sorted(results.keys()):
@@ -402,8 +559,8 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
             continue
 
         times = data["spike_times"]
-        sizes = data["window_sizes"]
         peak_pos = data["peak_indices"]
+        starts = data["window_starts"]
         n_osc = data["n_oscillations"]
 
         if len(waveforms) > max_waveforms:
@@ -411,50 +568,28 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
         else:
             sel = np.arange(len(waveforms))
         sub_wf = [waveforms[i] for i in sel]
-        sub_t = times[sel]
-        sub_size = sizes[sel]
         sub_peak = peak_pos[sel]
+        sub_start = starts[sel]
         sub_osc = n_osc[sel]
 
-        n = len(sub_wf)
-        n_rows = int(np.ceil(n / per_row))
-        fig, axes = plt.subplots(
-            n_rows, per_row, figsize=(per_row * 2.0, n_rows * 1.2), squeeze=False)
-
-        for ax, (wf, pk) in zip(axes.flat, zip(sub_wf, sub_peak)):
-            t_axis = _window_time_axis(wf)
-            ax.plot(t_axis, wf, linewidth=0.6, color="#1f77b4")
-            line_ms = (pk - len(wf) // 2) * (1000.0 / SAMPLE_RATE_HZ)
-            ax.axvline(line_ms, color="k", linewidth=0.4, alpha=0.4)
-            ax.tick_params(labelsize=5)
-            ax.set_yticks([])
-        for ax in axes.flat[n:]:
-            ax.set_visible(False)
-
-        fig.tight_layout()
-        img = _figure_to_base64(fig, dpi=dpi, tight=False)
-        W = int(fig.get_size_inches()[0] * dpi)
-        H = int(fig.get_size_inches()[1] * dpi)
-
-        areas = []
-        for j, ax in enumerate(axes.flat):
-            if j >= n:
-                break
-            pos = ax.get_position()
-            x0, y0 = int(pos.x0 * W), int((1 - pos.y1) * H)
-            x1, y1 = int(pos.x1 * W), int((1 - pos.y0) * H)
-            t = float(sub_t[j])
-            margin = (float(sub_size[j]) * 1000.0 / SAMPLE_RATE_HZ / 2.0 + context_ms) / 1000.0
+        tiles = []
+        for j, wf in enumerate(sub_wf):
+            fig = _tile_figure(wf, int(sub_start[j]), int(sub_peak[j]),
+                               int(sub_osc[j]))
+            img = _figure_to_base64(fig, dpi=dpi, tight=False)
+            t = float(times[sel[j]])
+            margin = (len(wf) / (2.0 * SAMPLE_RATE_HZ) + context_ms / 1000.0)
             t0 = max(0.0, t - margin)
             t1 = t + margin
-            href = (f"{interactive_pattern.format(ch=ch)}"
+            href = (f"{interactive_dir}/{interactive_pattern.format(ch=ch)}"
                     f"?t0={t0:.4f}&t1={t1:.4f}")
-            areas.append(
-                f'        <area shape="rect" coords="{x0},{y0},{x1},{y1}" '
-                f'href="{href}" target="_blank" '
-                f'title="ch{ch} event t={t:.3f}s, {int(sub_osc[j])} oscillations">')
+            tiles.append(
+                f'        <a class="tile" href="{href}" target="_blank" '
+                f'title="ch{ch} event t={t:.3f}s, {int(sub_osc[j])} osc">\n'
+                f'          <img src="data:image/png;base64,{img}" '
+                f'alt="ch{ch} t={t:.3f}s">\n'
+                f'        </a>')
 
-        map_name = f"wavemap_{ch}"
         html_parts.append(f"""
         <div class="channel-section">
             <div class="channel-header">
@@ -466,12 +601,9 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
                     <strong>Noise (MAD):</strong> {data['std_dev']:.2f} uV
                 </div>
             </div>
-            <img class="grid-img" width="{W}" height="{H}"
-                 src="data:image/png;base64,{img}" usemap="#{map_name}"
-                 alt="Channel {ch} waveforms">
-            <map name="{map_name}">
-{chr(10).join(areas)}
-            </map>
+            <div class="tile-grid">
+{chr(10).join(tiles)}
+            </div>
         </div>
         """)
 
@@ -482,6 +614,12 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
 def gen_channel_html(results: Dict[int, Dict[str, Any]],
                      output_file: str, raw_file: str,
                      ds_factor: int = CHANNEL_DS_FACTOR) -> None:
+    """Render one full-trace figure per channel (downsampled overview).
+
+    The trace is decimated by CHANNEL_DS_FACTOR (y -> y[::ds]) for a light
+    PNG; detected dominant peaks are overlaid as red dots and the spike gate
+    as a dashed line. Purely visual, no analysis.
+    """
     print(f"\nGenerating full-trace HTML: {output_file}")
     data = load_raw_data(raw_file)
     html_parts = _html_head("MEA Channel Traces")
@@ -536,6 +674,16 @@ def gen_channel_interactive_html(results: Dict[int, Dict[str, Any]],
                                  spike_ds: int = INTERACTIVE_SPIKE_DS,
                                  context_ms: float = SPIKE_CONTEXT_MS,
                                  plotly_js: str = PLOTLY_JS) -> None:
+    """One self-contained plotly view per channel, with click-to-zoom.
+
+    The plot stacks (1) a heavily downsampled full-trace overview
+    (decimation INTERACTIVE_OVERVIEW_DS), (2) high-resolution context
+    segments around every detected peak (windowed +/- SPIKE_CONTEXT_MS,
+    decimation INTERACTIVE_SPIKE_DS, joined with NaN gaps), and (3) red
+    markers at the dominant peaks. The URL query ?t0=..&t1=.. selects the
+    initial x-axis range (used by the grid tiles) via a JS snippet injected
+    before </body>:  Plotly.relayout('interactive', {'xaxis.range': [t0, t1]}).
+    """
     import plotly.graph_objects as go
 
     res = results[channel]
@@ -611,16 +759,100 @@ def gen_channel_interactive_html(results: Dict[int, Dict[str, Any]],
     print(f"  Saved interactive HTML to: {output_file}")
 
 
+def _resolve_run_paths(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path]:
+    """Determine the run directory and all output paths.
+
+    Normal run: creates a fresh timestamped run dir
+        <OUTPUT_ROOT>/<YYYY-MM-DD_HH-MM-SS>/
+    so every invocation is archived for iteration tracking (old runs are
+    never overwritten).
+
+    Visualize-only (-v): re-derives the run dir from the supplied .npz path.
+    If the npz lives at <run_dir>/waveforms/waveforms.npz the run dir is
+    npz.parent.parent; otherwise npz.parent is used. HTML is (re)written
+    into <run_dir>/html/, so a previous run can be re-rendered in place.
+
+    Returns (run_dir, npz_path, grid_path, channel_path, interactive_dir).
+    """
+    if args.visualize_only:
+        if not args.output:
+            raise ValueError("-v requires -o <path-to-waveforms.npz>")
+        npz_path = Path(args.output)
+        if npz_path.parent.name == "waveforms" and npz_path.name == "waveforms.npz":
+            run_dir = npz_path.parent.parent
+        else:
+            run_dir = npz_path.parent
+    else:
+        run_dir = (Path(args.out_root)
+                   / datetime.datetime.now().strftime(TIMESTAMP_FORMAT))
+        run_dir.mkdir(parents=True, exist_ok=True)
+        npz_path = run_dir / WAVEFORM_REL_PATH
+
+    html_dir = run_dir / "html"
+    grid_path = args.spike_html or str(html_dir / "waveforms_grid.html")
+    channel_path = args.channel_html or str(html_dir / "all_ch_spikes.html")
+    return run_dir, npz_path, grid_path, channel_path, html_dir
+
+
+def _write_run_meta(run_dir: Path, args: argparse.Namespace,
+                    results: Dict[int, Dict[str, Any]], npz_path: Path) -> None:
+    """Write run_meta.json: parameters, timestamps and per-channel summary.
+
+    Mirrors the constants in this module so any archived run can be fully
+    reconstructed / cross-referenced during writing of the methods section.
+    """
+    per_channel = {}
+    for ch in sorted(results.keys()):
+        d = results[ch]
+        per_channel[str(ch)] = {
+            "n_events": int(d["n_events"]),
+            "n_extracted": int(d["n_extracted"]),
+            "spike_gate_uV": round(float(d["threshold"]), 3),
+            "envelope_gate_uV": round(float(d["gate"]), 3),
+            "noise_mad_uV": round(float(d["std_dev"]), 3),
+        }
+    meta = {
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "source_file": args.data_file,
+        "waveforms_npz": str(npz_path),
+        "sample_rate_hz": SAMPLE_RATE_HZ,
+        "voltage_scale_uv_per_lsb": VOLTAGE_SCALE,
+        "parameters": {
+            "event_gate_scale": EVENT_GATE_SCALE,
+            "spike_gate_scale": SPIKE_GATE_SCALE,
+            "event_gap_ms": EVENT_GAP_MS,
+            "min_event_ms": MIN_EVENT_MS,
+            "oscillation_min_distance_samples": OSCILLATION_MIN_DISTANCE,
+            "pre_pad_ms": PRE_PAD_MS,
+            "post_pad_ms": POST_PAD_MS,
+            "min_window_ms": MIN_WINDOW_MS,
+            "max_window_ms": MAX_WINDOW_MS,
+        },
+        "channels": per_channel,
+        "totals": {
+            "events": int(sum(d["n_events"] for d in results.values())),
+            "extracted": int(sum(d["n_extracted"] for d in results.values())),
+        },
+    }
+    (run_dir / RUN_META_FILENAME).write_text(
+        json.dumps(meta, indent=2))
+    print(f"Saved run metadata to: {run_dir / RUN_META_FILENAME}")
+
+
 def main(args: argparse.Namespace) -> None:
+    run_dir, npz_path, grid_path, channel_path, html_dir = _resolve_run_paths(args)
+    interactive_dir = html_dir / INTERACTIVE_HTML_DIR
+
     print("=" * 60)
     print("MEA Spike Waveform Pipeline (event-based)")
     print("=" * 60)
     print(f"Data file:  {args.data_file}")
-    print(f"Waveforms:  {args.output}")
+    print(f"Run dir:    {run_dir}")
+    print(f"Waveforms:  {npz_path}")
     print("=" * 60)
 
     if args.visualize_only:
-        results = load_waveforms(args.output)
+        results = load_waveforms(npz_path)
         if not results:
             print("Error: No data loaded. Run without -v first.")
             return
@@ -629,22 +861,23 @@ def main(args: argparse.Namespace) -> None:
         results: Dict[int, Dict[str, Any]] = {}
         for ch in range(data.shape[1]):
             results[ch] = process_channel(data, ch)
-        save_waveforms(results, args.output, source_file=args.data_file)
+        save_waveforms(results, npz_path, source_file=args.data_file)
+        _write_run_meta(run_dir, args, results, npz_path)
 
-    out_dir = Path(args.spike_html).parent
     for ch in sorted(results.keys()):
         if results[ch]["n_extracted"] > 0:
             gen_channel_interactive_html(
                 results, ch, args.data_file,
-                str(out_dir / INTERACTIVE_HTML_PATTERN.format(ch=ch)))
+                str(interactive_dir / INTERACTIVE_HTML_PATTERN.format(ch=ch)))
 
-    gen_spike_waveform_html(results, args.spike_html,
-                            interactive_pattern=INTERACTIVE_HTML_PATTERN)
-    gen_channel_html(results, args.channel_html, raw_file=args.data_file)
+    gen_spike_waveform_html(results, grid_path,
+                            interactive_pattern=INTERACTIVE_HTML_PATTERN,
+                            interactive_dir=INTERACTIVE_HTML_DIR)
+    gen_channel_html(results, channel_path, raw_file=args.data_file)
 
     print("\n" + "=" * 60)
     print("DONE!")
-    print(f"Open {args.spike_html} in your browser")
+    print(f"Open {grid_path} in your browser")
     print("=" * 60)
 
 
@@ -655,13 +888,20 @@ if __name__ == "__main__":
     )
     parser.add_argument("-d", "--data-file", type=str, default=RAW_DATA_FILE,
                         help="Path to raw MEA binary recording")
-    parser.add_argument("-o", "--output", type=str, default=WAVEFORM_OUTPUT_FILE,
-                        help="Output .npz path for extracted waveforms")
-    parser.add_argument("-s", "--spike-html", type=str, default=SPIKE_HTML_OUTPUT_FILE,
-                        help="Output HTML path for the waveform grid")
-    parser.add_argument("-c", "--channel-html", type=str, default=CHANNEL_HTML_OUTPUT_FILE,
-                        help="Output HTML path for the full-trace view")
+    parser.add_argument("-o", "--output", type=str, default=None,
+                        help="Output .npz path; default <out-root>/<ts>/"
+                             "waveforms/waveforms.npz (in -v mode, required: "
+                             "path to a previous run's .npz)")
+    parser.add_argument("--out-root", type=str, default=OUTPUT_ROOT,
+                        help="Directory under which timestamped runs are stored")
+    parser.add_argument("-s", "--spike-html", type=str, default=None,
+                        help="Output HTML path for the waveform grid "
+                             "(default <run-dir>/html/waveforms_grid.html)")
+    parser.add_argument("-c", "--channel-html", type=str, default=None,
+                        help="Output HTML path for the full-trace view "
+                             "(default <run-dir>/html/all_ch_spikes.html)")
     parser.add_argument("-v", "--visualize-only", action="store_true",
-                        help="Only render HTML from previously extracted waveforms")
+                        help="Only render HTML from previously extracted "
+                             "waveforms (-o points at a previous .npz)")
     args = parser.parse_args()
     main(args)
