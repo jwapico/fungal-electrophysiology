@@ -1,29 +1,21 @@
-"""  <-- paste the content of the revised file below -->
-raw_analysis.py
+"""
+raw_analysis.py  (rev 3 - event-based)
 
-MEA spike waveform extraction pipeline for fungal recordings.
+Replaces per-peak spike detection with EVENT segmentation:
 
-Loads raw interleaved Intan binary MEA data, detects spikes on every
-channel, extracts waveform windows around each spike, persists the
-results to a single self-describing .npz file, and renders HTML views:
+  - noise floor via robust estimator (MAD default: the low envelope gate must
+    not be inflated by the very events we are segmenting - on ch40 std=8.7uV
+    inflates the gate to 52uV and truncates the small envelope oscillations,
+    while MAD=2.9uV keeps them)
+  - envelope gate: contiguous |voltage| > gate  ->  excursion
+  - excursions separated by <= EVENT_GAP_MS are merged into ONE event
+  - an event is kept only if its dominant |deflection| exceeds the spike gate
+  - window = [onset - pre_pad, offset + post_pad], clamped to
+    [MIN_WINDOW_MS, MAX_WINDOW_MS]; oversized events are centered on the
+    dominant peak
 
-  1. waveforms_grid.html      - grid of every extracted spike window, per
-                                channel; click a window to open the channel's
-                                interactive view zoomed to that segment
-  2. all_ch_spikes.html       - the full downsampled channel trace with the
-                                detected spikes marked
-  3. channel_N_interactive.html - per-channel plotly view (opens zoomed when
-                                reached from the grid via ?t0=..&t1=..)
-
-The raw signal is never inverted or otherwise altered: spikes are
-detected as positive-going prominences in the recorded orientation
-(see DETECT_TROUGHS for the opposite polarity). Waveforms are stored
-unsmoothed and unnormalized, in raw microvolts.
-
-Run from the project root:
-    python raw_analysis.py
-    python raw_analysis.py --data-file <path> -v
-    python raw_analysis.py --window-mode adaptive
+Each event yields one waveform window spanning the WHOLE oscillatory event
+(variable number of oscillations), aligned on the dominant peak.
 """
 from __future__ import annotations
 
@@ -31,7 +23,7 @@ import argparse
 import base64
 import io
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -39,6 +31,7 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
 import numpy as np
+import scipy.ndimage
 import scipy.optimize
 import scipy.signal
 
@@ -53,29 +46,24 @@ WAVEFORM_OUTPUT_FILE: str = "outputs/waveforms/waveforms.npz"
 SPIKE_HTML_OUTPUT_FILE: str = "outputs/html/waveforms_grid.html"
 CHANNEL_HTML_OUTPUT_FILE: str = "outputs/html/all_ch_spikes.html"
 INTERACTIVE_HTML_PATTERN: str = "channel_{ch}_interactive.html"
-PLOTLY_JS: str = "cdn"  # "cdn" (small, needs internet) | "inline" (offline, ~3.5MB/file)
+PLOTLY_JS: str = "cdn"
 
-ST_DEV_SCALE: float = 16.0
-LOWER_THRESHOLD_FACTOR: float = 0.5
-MIN_SPIKE_DISTANCE: int = 50
-DETECT_TROUGHS: bool = False
+# ---------------- event segmentation ----------------
+EVENT_NOISE_ESTIMATOR: Callable[[np.ndarray], float] = \
+    lambda x: float(1.4826 * np.median(np.abs(x - np.median(x))))  # MAD
+EVENT_GATE_SCALE: float = 5.0    # low envelope gate  (x noise)
+SPIKE_GATE_SCALE: float = 16.0   # high gate: an event's dominant peak must clear this
+EVENT_GAP_MS: float = 5.0        # merge excursions <= this apart into one event
+MIN_EVENT_MS: float = 1.5        # discard envelope blips shorter than this
+OSCILLATION_MIN_DISTANCE: int = 30  # min samples between oscillation peaks (1 ms)
 
-FIT_SEED_WINDOW_MS: float = 10.0
-SEARCH_WINDOW_SAMPLES: int = 50
-GAUSS_WINDOW_MULT: int = 8
+# ---------------- window extraction ----------------
+PRE_PAD_MS: float = 2.0
+POST_PAD_MS: float = 2.0
 MIN_WINDOW_MS: float = 3.0
-MAX_WINDOW_MS: float = 20.0
-DEFAULT_WINDOW_MS: float = 10.0
-GAUSS_MAX_EVALS: int = 5000
+MAX_WINDOW_MS: float = 60.0
 
-WINDOW_GAUSS_P0: List[float] = [-1, 0.6, 0.1, 1, 1, 0.3]
-WINDOW_GAUSS_LB: List[float] = [-10, -10, 0.0, -10, -10, 0.1]
-WINDOW_GAUSS_UB: List[float] = [0, 10, 2.0, 10, 10, 10]
-
-# windowing policy
-WINDOW_MODE: str = "fixed"       # "fixed" | "adaptive"
-FIXED_WINDOW_MS: float = 6.0     # extraction window size in fixed mode
-
+# ---------------- visualization ----------------
 CHANNEL_DS_FACTOR: int = 10
 MAX_WAVEFORMS_PER_CHANNEL: int = 200
 WAVEFORMS_PER_ROW: int = 6
@@ -83,11 +71,17 @@ FIGURE_DPI: int = 80
 TRACE_DPI: int = 100
 RANDOM_SEED: int = 0
 
-# interactive view
-INTERACTIVE_OVERVIEW_DS: int = 200     # downsample of the full-trace overview
-INTERACTIVE_SPIKE_DS: int = 4          # downsample of per-spike context segments
-SPIKE_CONTEXT_MS: float = 200.0        # total +/- window embedded around each spike
-INTERACTIVE_CONTEXT_MS: float = 100.0  # extra +/- shown when a window is clicked
+INTERACTIVE_OVERVIEW_DS: int = 200
+INTERACTIVE_SPIKE_DS: int = 4
+SPIKE_CONTEXT_MS: float = 200.0
+INTERACTIVE_CONTEXT_MS: float = 100.0
+
+
+class Event(NamedTuple):
+    onset: int
+    offset: int
+    main: int            # dominant (largest |deflection|) sample
+    n_oscillations: int
 
 
 def load_raw_data(filepath: str) -> np.ndarray:
@@ -112,166 +106,140 @@ def estimate_noise_mad(x: np.ndarray) -> float:
     return float(1.4826 * np.median(np.abs(x - median)))
 
 
-def detect_spikes(
+def detect_events(
     voltage: np.ndarray,
-    st_dev_scale: float = ST_DEV_SCALE,
-    min_distance: int = MIN_SPIKE_DISTANCE,
-    lower_factor: float = LOWER_THRESHOLD_FACTOR,
-    troughs: bool = DETECT_TROUGHS,
-    noise_estimator: Callable[[np.ndarray], float] = estimate_noise_std,
-) -> Tuple[np.ndarray, float, float]:
-    probe = -voltage if troughs else voltage
-    std_dev = noise_estimator(probe)
-    threshold = st_dev_scale * std_dev
-
-    # height gate: the candidate must itself exceed the threshold in absolute
-    # amplitude, not merely rise above a neighbouring valley. Prominence alone
-    # passes tiny bumps sitting between large deflections (false positives).
-    peak_indices, _ = scipy.signal.find_peaks(
-        probe, height=threshold, prominence=threshold, distance=min_distance
-    )
-
-    if len(peak_indices) == 0:
-        fallback_threshold = threshold * lower_factor
-        peak_indices, _ = scipy.signal.find_peaks(
-            probe, height=fallback_threshold, prominence=fallback_threshold,
-            distance=min_distance,
-        )
-        threshold = fallback_threshold
-
-    return peak_indices, float(threshold), float(std_dev)
-
-
-def gaussian2(x: np.ndarray, a1: float, b1: float, c1: float,
-              a2: float, b2: float, c2: float) -> np.ndarray:
-    return (a1 * np.exp(-((x - b1) / c1) ** 2) +
-            a2 * np.exp(-((x - b2) / c2) ** 2))
-
-
-def estimate_adaptive_window(spike_segment: np.ndarray,
-                             sample_rate: int = SAMPLE_RATE_HZ) -> int:
-    n_samples = len(spike_segment)
-    time_ms = np.arange(n_samples) / (sample_rate / 1000.0)
-    centered = spike_segment - np.mean(spike_segment)
-    spike_norm = centered / (np.max(np.abs(centered)) + 1e-10)
-    try:
-        popt, _ = scipy.optimize.curve_fit(
-            gaussian2, time_ms, spike_norm,
-            p0=WINDOW_GAUSS_P0, bounds=(WINDOW_GAUSS_LB, WINDOW_GAUSS_UB),
-            maxfev=GAUSS_MAX_EVALS,
-        )
-        c1, c2 = abs(popt[2]), abs(popt[5])
-        window_ms = GAUSS_WINDOW_MULT * (c1 + c2)
-    except Exception:
-        window_ms = DEFAULT_WINDOW_MS
-    window_ms = float(min(max(window_ms, MIN_WINDOW_MS), MAX_WINDOW_MS))
-    return int(window_ms * sample_rate / 1000)
-
-
-def find_true_peak(spike_idx: int, voltage: np.ndarray,
-                   search_window: int = SEARCH_WINDOW_SAMPLES,
-                   troughs: bool = DETECT_TROUGHS) -> Optional[int]:
-    """Refine a detection to the extremum of the *detected* polarity.
-
-    Aligning on the probe polarity (rather than argmax |.|) keeps the window
-    centred on the lobe that was detected; argmax |.| could flip to the
-    opposite-polarity lobe of a biphasic spike.
-    """
-    search_start = spike_idx - search_window
-    search_end = spike_idx + search_window
-    if search_start < 0 or search_end >= len(voltage):
-        return None
-    probe = -voltage if troughs else voltage
-    segment = probe[search_start:search_end]
-    return search_start + int(np.argmax(segment))
-
-
-def extract_waveform(spike_idx: int, voltage: np.ndarray,
-                     peak_indices: Optional[np.ndarray] = None,
-                     window_mode: str = WINDOW_MODE,
-                     fixed_window_ms: float = FIXED_WINDOW_MS,
-                     seed_window_ms: float = FIT_SEED_WINDOW_MS,
-                     troughs: bool = DETECT_TROUGHS,
-                     sample_rate: int = SAMPLE_RATE_HZ,
-                     ) -> Optional[Tuple[np.ndarray, float, int, int, int]]:
-    """
-    Extract a waveform window around a detected spike.
+    noise_estimator: Callable[[np.ndarray], float] = EVENT_NOISE_ESTIMATOR,
+    gate_scale: float = EVENT_GATE_SCALE,
+    spike_gate_scale: float = SPIKE_GATE_SCALE,
+    gap_ms: float = EVENT_GAP_MS,
+    min_event_ms: float = MIN_EVENT_MS,
+    osc_min_distance: int = OSCILLATION_MIN_DISTANCE,
+    sample_rate: int = SAMPLE_RATE_HZ,
+) -> Tuple[List[Event], float, float, float]:
+    """Segment the trace into multi-oscillation spike events.
 
     Returns:
-        (waveform, spike_time_sec, window_samples, window_start_idx, peak_idx)
-        or None if too close to the trace boundary.
+        (events, noise, gate, spike_gate)
     """
-    if window_mode == "adaptive":
-        seed_samples = int(seed_window_ms * sample_rate / 1000)
-        if spike_idx < seed_samples or spike_idx >= len(voltage) - seed_samples:
-            return None
-        seed_segment = voltage[spike_idx - seed_samples:spike_idx + seed_samples]
-        window_samples = estimate_adaptive_window(seed_segment, sample_rate)
-        # never let an adaptive window swallow a neighbouring detection
-        if peak_indices is not None:
-            others = np.abs(np.asarray(peak_indices, dtype=np.int64) - spike_idx)
-            others = others[others > 0]
-            if len(others) > 0:
-                window_samples = min(window_samples,
-                                     int(2 * others.min() * sample_rate / 1000))
+    noise = float(noise_estimator(voltage))
+    gate = gate_scale * noise
+    spike_gate = spike_gate_scale * noise
+
+    idx = np.flatnonzero(np.abs(voltage) > gate)
+    if len(idx) == 0:
+        return [], noise, gate, spike_gate
+
+    run_breaks = np.flatnonzero(np.diff(idx) > 1)
+    run_starts = np.r_[idx[0], idx[run_breaks + 1]]
+    run_ends = np.r_[idx[run_breaks], idx[-1]]
+
+    # merge contiguous excursions separated by <= gap_samples
+    gap_samples = int(gap_ms * sample_rate / 1000)
+    merged: List[List[int]] = []
+    for s, e in zip(run_starts, run_ends):
+        if merged and (s - merged[-1][1] - 1) <= gap_samples:
+            merged[-1][1] = e
+        else:
+            merged.append([int(s), int(e)])
+
+    min_event_samples = int(min_event_ms * sample_rate / 1000)
+    events: List[Event] = []
+    for s, e in merged:
+        if e - s + 1 < min_event_samples:
+            continue
+        seg = voltage[s:e + 1]
+        main = s + int(np.argmax(np.abs(seg)))
+        if abs(voltage[main]) < spike_gate:
+            continue
+        n_osc = len(scipy.signal.find_peaks(
+            np.abs(seg), height=gate, distance=osc_min_distance)[0])
+        events.append(Event(onset=s, offset=e, main=main, n_oscillations=n_osc))
+
+    return events, noise, gate, spike_gate
+
+
+def extract_event_window(
+    ev: Event, voltage: np.ndarray,
+    pre_pad_ms: float = PRE_PAD_MS,
+    post_pad_ms: float = POST_PAD_MS,
+    min_window_ms: float = MIN_WINDOW_MS,
+    max_window_ms: float = MAX_WINDOW_MS,
+    sample_rate: int = SAMPLE_RATE_HZ,
+) -> Optional[Tuple[np.ndarray, float, int, int, int]]:
+    """Window around a whole event, aligned on the dominant peak.
+
+    Returns:
+        (waveform, event_time_sec, window_samples, window_start_idx, peak_idx)
+        or None if the trace is too short to hold the window.
+    """
+    pre = int(pre_pad_ms * sample_rate / 1000)
+    post = int(post_pad_ms * sample_rate / 1000)
+    min_w = int(min_window_ms * sample_rate / 1000)
+    max_w = int(max_window_ms * sample_rate / 1000)
+
+    natural_w = (ev.offset + post) - (ev.onset - pre) + 1
+    if natural_w > max_w:
+        w = max_w
+        start = ev.main - w // 2
+    elif natural_w < min_w:
+        w = min_w
+        start = ev.main - w // 2
     else:
-        window_samples = int(fixed_window_ms * sample_rate / 1000)
+        w = natural_w
+        start = ev.onset - pre
 
-    window_samples = int(min(max(window_samples, MIN_WINDOW_MS * sample_rate / 1000),
-                             MAX_WINDOW_MS * sample_rate / 1000))
-
-    true_peak = find_true_peak(spike_idx, voltage, troughs=troughs)
-    if true_peak is None:
+    if w <= 0:
         return None
+    start = int(max(0, min(start, len(voltage) - w)))
+    end = start + w
 
-    half = window_samples // 2
-    start_idx = true_peak - half
-    end_idx = start_idx + window_samples
-    if start_idx < 0 or end_idx > len(voltage):
-        return None
-
-    waveform = voltage[start_idx:end_idx].copy()
-    spike_time_sec = true_peak / sample_rate
-    return waveform, spike_time_sec, window_samples, start_idx, true_peak
+    waveform = voltage[start:end].copy()
+    return (waveform, ev.main / sample_rate, w, start, ev.main - start)
 
 
-def process_channel(data: np.ndarray, channel: int,
-                    window_mode: str = WINDOW_MODE) -> Dict[str, Any]:
+def process_channel(data: np.ndarray, channel: int) -> Dict[str, Any]:
     print(f"\nProcessing channel {channel}...")
     voltage = data[:, channel] * VOLTAGE_SCALE
-    peak_indices, threshold, std_dev = detect_spikes(noise_estimator=estimate_noise_mad, voltage=voltage)
-    print(f"  Detected {len(peak_indices)} spikes (threshold: {threshold:.2f} uV)")
+    events, noise, gate, spike_gate = detect_events(voltage)
+    print(f"  Found {len(events)} events (gate {gate:.2f} uV, "
+          f"spike gate {spike_gate:.2f} uV, noise {noise:.2f} uV)")
 
     waveforms: List[np.ndarray] = []
-    spike_times: List[float] = []
+    event_times: List[float] = []
     window_sizes: List[int] = []
     window_starts: List[int] = []
     peak_positions: List[int] = []
+    n_oscillations: List[int] = []
+    amplitudes: List[float] = []
 
-    for spike_idx in peak_indices:
-        result = extract_waveform(spike_idx, voltage, peak_indices,
-                                  window_mode=window_mode)
+    for ev in events:
+        result = extract_event_window(ev, voltage)
         if result is None:
             continue
-        waveform, spike_time, win_size, start_idx, peak_idx = result
+        waveform, etime, win_size, start_idx, peak_idx = result
         waveforms.append(waveform)
-        spike_times.append(spike_time)
+        event_times.append(etime)
         window_sizes.append(win_size)
         window_starts.append(start_idx)
-        peak_positions.append(peak_idx - start_idx)
+        peak_positions.append(peak_idx)
+        n_oscillations.append(ev.n_oscillations)
+        amplitudes.append(float(voltage[ev.main]))
 
     n_extracted = len(waveforms)
     print(f"  Extracted {n_extracted} waveforms")
 
     return {
         "waveforms": waveforms,
-        "spike_times": np.array(spike_times),
-        "window_sizes": np.array(window_sizes),
-        "peak_indices": np.array(peak_positions),      # position within the window
-        "window_starts": np.array(window_starts),
-        "threshold": threshold,
-        "std_dev": std_dev,
-        "n_detected": len(peak_indices),
+        "spike_times": np.array(event_times),
+        "window_sizes": np.array(window_sizes, dtype=int),
+        "peak_indices": np.array(peak_positions, dtype=int),
+        "window_starts": np.array(window_starts, dtype=int),
+        "n_oscillations": np.array(n_oscillations, dtype=int),
+        "amplitudes": np.array(amplitudes, dtype=float),
+        "threshold": spike_gate,
+        "gate": gate,
+        "std_dev": noise,
+        "n_events": len(events),
         "n_extracted": n_extracted,
     }
 
@@ -288,9 +256,12 @@ def save_waveforms(results: Dict[int, Dict[str, Any]],
     window_sizes = np.empty(n_ch, dtype=object)
     peak_positions = np.empty(n_ch, dtype=object)
     window_starts = np.empty(n_ch, dtype=object)
+    n_osc = np.empty(n_ch, dtype=object)
+    amplitudes = np.empty(n_ch, dtype=object)
     thresholds = np.zeros(n_ch)
+    gates = np.zeros(n_ch)
     stds = np.zeros(n_ch)
-    n_detected = np.zeros(n_ch, dtype=int)
+    n_events = np.zeros(n_ch, dtype=int)
     n_extracted = np.zeros(n_ch, dtype=int)
 
     for i, ch in enumerate(channels):
@@ -300,9 +271,12 @@ def save_waveforms(results: Dict[int, Dict[str, Any]],
         window_sizes[i] = np.asarray(d["window_sizes"], dtype=int)
         peak_positions[i] = np.asarray(d["peak_indices"], dtype=int)
         window_starts[i] = np.asarray(d["window_starts"], dtype=int)
+        n_osc[i] = np.asarray(d["n_oscillations"], dtype=int)
+        amplitudes[i] = np.asarray(d["amplitudes"], dtype=float)
         thresholds[i] = d["threshold"]
+        gates[i] = d["gate"]
         stds[i] = d["std_dev"]
-        n_detected[i] = d["n_detected"]
+        n_events[i] = d["n_events"]
         n_extracted[i] = d["n_extracted"]
 
     payload = {
@@ -312,18 +286,22 @@ def save_waveforms(results: Dict[int, Dict[str, Any]],
         "window_sizes": window_sizes,
         "peak_positions": peak_positions,
         "window_starts": window_starts,
+        "n_oscillations": n_osc,
+        "amplitudes": amplitudes,
         "thresholds": thresholds,
+        "gates": gates,
         "stds": stds,
-        "n_detected": n_detected,
+        "n_events": n_events,
         "n_extracted": n_extracted,
         "sample_rate": SAMPLE_RATE_HZ,
         "unit": "uV",
         "source_file": source_file,
         "min_window_ms": MIN_WINDOW_MS,
         "max_window_ms": MAX_WINDOW_MS,
-        "window_mode": WINDOW_MODE,
-        "fixed_window_ms": FIXED_WINDOW_MS,
-        "st_dev_scale": ST_DEV_SCALE,
+        "pre_pad_ms": PRE_PAD_MS,
+        "post_pad_ms": POST_PAD_MS,
+        "event_gate_scale": EVENT_GATE_SCALE,
+        "spike_gate_scale": SPIKE_GATE_SCALE,
     }
     np.savez_compressed(output_path, **payload)
     print(f"\nSaved waveforms to: {output_file}")
@@ -339,20 +317,21 @@ def load_waveforms(output_file: str) -> Dict[int, Dict[str, Any]]:
     results: Dict[int, Dict[str, Any]] = {}
     for i, ch in enumerate(channels):
         cid = int(ch)
-        peak_pos = np.asarray(data["peak_positions"][i], dtype=int)
         results[cid] = {
             "waveforms": list(data["waveforms"][i]),
             "spike_times": np.asarray(data["spike_times"][i]),
             "window_sizes": np.asarray(data["window_sizes"][i]),
-            "peak_indices": peak_pos,
-            "window_starts": np.asarray(data["window_starts"][i]),
+            "peak_indices": np.asarray(data["peak_positions"][i], dtype=int),
+            "window_starts": np.asarray(data["window_starts"][i], dtype=int),
+            "n_oscillations": np.asarray(data["n_oscillations"][i], dtype=int),
+            "amplitudes": np.asarray(data["amplitudes"][i], dtype=float),
             "threshold": float(data["thresholds"][i]),
+            "gate": float(data["gates"][i]),
             "std_dev": float(data["stds"][i]),
-            "n_detected": int(data["n_detected"][i]),
+            "n_events": int(data["n_events"][i]),
             "n_extracted": int(data["n_extracted"][i]),
         }
-        print(f"  Loaded channel {cid}: "
-              f"{results[cid]['n_extracted']} waveforms")
+        print(f"  Loaded channel {cid}: {results[cid]['n_extracted']} waveforms")
     return results
 
 
@@ -397,7 +376,6 @@ def _figure_to_base64(fig: Figure, dpi: int = FIGURE_DPI,
 
 def _window_time_axis(waveform: np.ndarray,
                       sample_rate: int = SAMPLE_RATE_HZ) -> np.ndarray:
-    """Time axis in ms centred on the *window centre* (not the extremum)."""
     return (np.arange(len(waveform)) - len(waveform) // 2) * (1000.0 / sample_rate)
 
 
@@ -412,10 +390,10 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
     rng = np.random.default_rng(RANDOM_SEED)
 
     html_parts = _html_head("MEA Spike Waveform Grid")
-    html_parts.append("    <p>Every extracted spike window, per channel. "
+    html_parts.append("    <p>Every extracted event window, per channel. "
                       "Time in ms, centred on the window; the vertical line marks "
-                      "the detected peak. Click a window to open the channel's "
-                      "interactive view zoomed to that segment.</p>")
+                      "the dominant peak. Click a window to open the channel's "
+                      "interactive view zoomed to that event.</p>")
 
     for ch in sorted(results.keys()):
         data = results[ch]
@@ -426,6 +404,7 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
         times = data["spike_times"]
         sizes = data["window_sizes"]
         peak_pos = data["peak_indices"]
+        n_osc = data["n_oscillations"]
 
         if len(waveforms) > max_waveforms:
             sel = np.sort(rng.choice(len(waveforms), max_waveforms, replace=False))
@@ -435,6 +414,7 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
         sub_t = times[sel]
         sub_size = sizes[sel]
         sub_peak = peak_pos[sel]
+        sub_osc = n_osc[sel]
 
         n = len(sub_wf)
         n_rows = int(np.ceil(n / per_row))
@@ -452,7 +432,6 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
             ax.set_visible(False)
 
         fig.tight_layout()
-        # save WITHOUT bbox_inches="tight" so ax positions map 1:1 to PNG pixels
         img = _figure_to_base64(fig, dpi=dpi, tight=False)
         W = int(fig.get_size_inches()[0] * dpi)
         H = int(fig.get_size_inches()[1] * dpi)
@@ -473,7 +452,7 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
             areas.append(
                 f'        <area shape="rect" coords="{x0},{y0},{x1},{y1}" '
                 f'href="{href}" target="_blank" '
-                f'title="ch{ch} spike t={t:.3f}s">')
+                f'title="ch{ch} event t={t:.3f}s, {int(sub_osc[j])} oscillations">')
 
         map_name = f"wavemap_{ch}"
         html_parts.append(f"""
@@ -481,10 +460,10 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
             <div class="channel-header">
                 <h2>Channel {ch}</h2>
                 <div class="stats">
-                    <strong>Detected:</strong> {data['n_detected']} |
+                    <strong>Events:</strong> {data['n_events']} |
                     <strong>Extracted:</strong> {data['n_extracted']} |
-                    <strong>Threshold:</strong> {data['threshold']:.2f} uV |
-                    <strong>Noise sigma:</strong> {data['std_dev']:.2f} uV
+                    <strong>Spike gate:</strong> {data['threshold']:.2f} uV |
+                    <strong>Noise (MAD):</strong> {data['std_dev']:.2f} uV
                 </div>
             </div>
             <img class="grid-img" width="{W}" height="{H}"
@@ -507,7 +486,7 @@ def gen_channel_html(results: Dict[int, Dict[str, Any]],
     data = load_raw_data(raw_file)
     html_parts = _html_head("MEA Channel Traces")
     html_parts.append("    <p>Full recording per channel with detected "
-                      "spikes marked (threshold shown dashed).</p>")
+                      "events marked (spike gate shown dashed).</p>")
 
     for ch in sorted(results.keys()):
         res = results[ch]
@@ -517,7 +496,6 @@ def gen_channel_html(results: Dict[int, Dict[str, Any]],
                    (SAMPLE_RATE_HZ / ds_factor) if ds_factor > 0
                    else np.arange(len(voltage_ds)) / SAMPLE_RATE_HZ)
 
-        # refined peak indices are stored per-window; reconstruct absolute indices
         abs_peaks = np.asarray(res["window_starts"]) + np.asarray(res["peak_indices"])
         peak_times = abs_peaks / SAMPLE_RATE_HZ
         peak_voltages = voltage[abs_peaks]
@@ -527,8 +505,8 @@ def gen_channel_html(results: Dict[int, Dict[str, Any]],
         ax.scatter(peak_times, peak_voltages, s=6, c="red", zorder=3)
         ax.axhline(res["threshold"], color="orange", linewidth=0.8,
                    linestyle="--", alpha=0.8)
-        ax.set_title(f"Channel {ch} - {res['n_extracted']} extracted spikes "
-                     f"(threshold: {res['threshold']:.2f} uV)")
+        ax.set_title(f"Channel {ch} - {res['n_extracted']} events "
+                     f"(spike gate: {res['threshold']:.2f} uV)")
         ax.set_xlabel("Time (seconds)")
         ax.set_ylabel("Voltage (uV)")
         fig.tight_layout()
@@ -538,10 +516,10 @@ def gen_channel_html(results: Dict[int, Dict[str, Any]],
             <div class="channel-header">
                 <h2>Channel {ch}</h2>
                 <div class="stats">
-                    <strong>Detected:</strong> {res['n_detected']} |
+                    <strong>Events:</strong> {res['n_events']} |
                     <strong>Extracted:</strong> {res['n_extracted']} |
-                    <strong>Threshold:</strong> {res['threshold']:.2f} uV |
-                    <strong>Noise sigma:</strong> {res['std_dev']:.2f} uV
+                    <strong>Spike gate:</strong> {res['threshold']:.2f} uV |
+                    <strong>Noise (MAD):</strong> {res['std_dev']:.2f} uV
                 </div>
             </div>
             <img src="data:image/png;base64,{img}" alt="Channel {ch} trace">
@@ -558,11 +536,6 @@ def gen_channel_interactive_html(results: Dict[int, Dict[str, Any]],
                                  spike_ds: int = INTERACTIVE_SPIKE_DS,
                                  context_ms: float = SPIKE_CONTEXT_MS,
                                  plotly_js: str = PLOTLY_JS) -> None:
-    """One self-contained plotly view per channel with click-zoom support.
-
-    The URL query parameters t0/t1 select the initial x-axis range, so the
-    waveform grid can deep-link ("channel_5_interactive.html?t0=..&t1=..").
-    """
     import plotly.graph_objects as go
 
     res = results[channel]
@@ -574,7 +547,6 @@ def gen_channel_interactive_html(results: Dict[int, Dict[str, Any]],
     abs_peaks = np.asarray(res["window_starts"]) + np.asarray(res["peak_indices"])
 
     fig = go.Figure()
-    # full-trace overview (coarse)
     if overview_ds > 1:
         t_over = np.arange(0, n_samples, overview_ds) / SAMPLE_RATE_HZ
         v_over = voltage[::overview_ds]
@@ -586,7 +558,6 @@ def gen_channel_interactive_html(results: Dict[int, Dict[str, Any]],
                              hovertemplate="t=%{x:.3f}s<br>%{y:.1f}uV",
                              hoverlabel=dict(bgcolor="#9ecae1")))
 
-    # higher-resolution context segments around each spike, joined with NaNs
     half = int(context_ms / 2000.0 * SAMPLE_RATE_HZ)
     ctx_t: List[float] = []
     ctx_v: List[float] = []
@@ -604,13 +575,13 @@ def gen_channel_interactive_html(results: Dict[int, Dict[str, Any]],
 
     fig.add_trace(go.Scatter(x=abs_peaks / SAMPLE_RATE_HZ,
                              y=voltage[abs_peaks], mode="markers",
-                             name="detected spike",
+                             name="dominant peak",
                              marker=dict(color="red", size=7, symbol="x"),
-                             hovertemplate="spike t=%{x:.3f}s<br>%{y:.1f}uV"))
+                             hovertemplate="t=%{x:.3f}s<br>%{y:.1f}uV"))
 
     fig.update_layout(
-        title=f"Channel {channel} - {res['n_extracted']} spikes "
-              f"(threshold {res['threshold']:.2f} uV)",
+        title=f"Channel {channel} - {res['n_extracted']} events "
+              f"(spike gate {res['threshold']:.2f} uV)",
         xaxis_title="Time (seconds)", yaxis_title="Voltage (uV)",
         template="plotly_white",
         margin=dict(l=40, r=20, t=60, b=40),
@@ -642,13 +613,10 @@ def gen_channel_interactive_html(results: Dict[int, Dict[str, Any]],
 
 def main(args: argparse.Namespace) -> None:
     print("=" * 60)
-    print("MEA Spike Waveform Pipeline")
+    print("MEA Spike Waveform Pipeline (event-based)")
     print("=" * 60)
     print(f"Data file:  {args.data_file}")
     print(f"Waveforms:  {args.output}")
-    print(f"Window:     {args.window_mode} "
-          f"({args.fixed_window_ms} ms)" if args.window_mode == "fixed"
-          else f"Window:     adaptive")
     print("=" * 60)
 
     if args.visualize_only:
@@ -660,19 +628,18 @@ def main(args: argparse.Namespace) -> None:
         data = load_raw_data(args.data_file)
         results: Dict[int, Dict[str, Any]] = {}
         for ch in range(data.shape[1]):
-            results[ch] = process_channel(data, ch, window_mode=args.window_mode)
+            results[ch] = process_channel(data, ch)
         save_waveforms(results, args.output, source_file=args.data_file)
 
     out_dir = Path(args.spike_html).parent
-    interactive_pattern = INTERACTIVE_HTML_PATTERN
     for ch in sorted(results.keys()):
         if results[ch]["n_extracted"] > 0:
             gen_channel_interactive_html(
                 results, ch, args.data_file,
-                str(out_dir / interactive_pattern.format(ch=ch)))
+                str(out_dir / INTERACTIVE_HTML_PATTERN.format(ch=ch)))
 
     gen_spike_waveform_html(results, args.spike_html,
-                            interactive_pattern=interactive_pattern)
+                            interactive_pattern=INTERACTIVE_HTML_PATTERN)
     gen_channel_html(results, args.channel_html, raw_file=args.data_file)
 
     print("\n" + "=" * 60)
@@ -694,11 +661,6 @@ if __name__ == "__main__":
                         help="Output HTML path for the waveform grid")
     parser.add_argument("-c", "--channel-html", type=str, default=CHANNEL_HTML_OUTPUT_FILE,
                         help="Output HTML path for the full-trace view")
-    parser.add_argument("-w", "--window-mode", type=str, default=WINDOW_MODE,
-                        choices=["fixed", "adaptive"],
-                        help="Window sizing: fixed (default) or adaptive (Gaussian)")
-    parser.add_argument("--fixed-window-ms", type=float, default=FIXED_WINDOW_MS,
-                        help="Window size in ms when --window-mode=fixed")
     parser.add_argument("-v", "--visualize-only", action="store_true",
                         help="Only render HTML from previously extracted waveforms")
     args = parser.parse_args()
