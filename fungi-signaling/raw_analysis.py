@@ -88,8 +88,8 @@ MIN_EVENT_MS: float = 1.5        # discard envelope blips shorter than this
 OSCILLATION_MIN_DISTANCE: int = 30  # min samples between oscillation peaks (1 ms)
 
 # ---------------- window extraction ----------------
-PRE_PAD_MS: float = 2.0
-POST_PAD_MS: float = 2.0
+PRE_PAD_MS: float = 30.0
+POST_PAD_MS: float = 30.0
 MIN_WINDOW_MS: float = 3.0
 MAX_WINDOW_MS: float = 60.0
 
