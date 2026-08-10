@@ -436,19 +436,24 @@ def merge_templates_global(families: List[Dict[str, Any]],
 
     Formal description
     ------------------
-    Each per-channel family a is a node with normalized template tau_a
-    (||tau||=1). Two nodes are connected when their absolute correlation
-    |<tau_a, tau_b>| >= r_thr; connected components (union-find) define the
-    global families. Because templates are unit-norm, the correlation equals
-    the cosine similarity; absolute value makes mirrored (sign-flipped)
-    shapes map to the same family.
+    Each per-channel family a is a node with template tau_a (mean waveform).
+    Two nodes are connected when their absolute template overlap
+        c_ab = |<tau_a, tau_b>|  (raw dot product)
+    is >= r_thr; connected components (union-find) define the global
+    families. NOTE: tau_a are means of unit-norm events, so ||tau_a|| <= 1
+    and varies with event amplitude; the raw overlap therefore scores shape
+    AND magnitude together (a family of small events can only merge with
+    another small-event family even at identical shape). The 0.85 default was
+    calibrated empirically against this metric (see threshold report: within-
+    channel max ~0.81, cross-channel p99 ~0.89). Absolute value makes
+    mirrored (sign-flipped) shapes map to the same family.
 
     Returns (components, node_to_global) where node index = (ch, fam) pairs
     enumerated in order of `families`; components are lists of node indices.
     """
     n = len(families)
     T = np.vstack([f["template"] for f in families])          # (n, L)
-    corr = np.abs(T @ T.T)                                     # unit-norm => cosines
+    corr = np.abs(T @ T.T)                                     # magnitude-weighted overlap
     np.fill_diagonal(corr, 0.0)
 
     parent = list(range(n))
@@ -616,6 +621,160 @@ def save_families(out_path: Path, run: Dict[str, Any], npz_path: Path) -> None:
     print(f"Saved families to: {out_path}")
 
 
+def gen_home_html(run_dir: Path) -> Path:
+    """Build html/index.html linking every visualization in a run directory.
+
+    Scans <run_dir> for the raw_analysis and spike_sorting outputs that
+    actually exist (waveform grid, full traces, per-channel interactive views,
+    family galleries, detail pages, threshold reports, meta) and writes a
+    single index page. Returns the index path.
+    """
+    html_dir = run_dir / "html"
+    html_dir.mkdir(parents=True, exist_ok=True)
+    fam_dir = run_dir / "families"
+    index = html_dir / "index.html"
+
+    rel = lambda p: p.relative_to(run_dir).as_posix()
+
+    def link(title: str, path: Path, note: str = "") -> str:
+        return (f'<li><a href="../{rel(path)}">{title}</a>'
+                + (f" <span style='color:#888'>&mdash; {note}</span>" if note else "")
+                + "</li>")
+
+    links: List[str] = []
+    links.append(link("Event waveform grid", html_dir / "waveforms_grid.html"))
+    links.append(link("Full per-channel traces (with events)",
+                      html_dir / "all_ch_spikes.html"))
+    inter_dir = html_dir / "interactive_ch_views"
+    inter_files = sorted(inter_dir.glob("channel_*_interactive.html")) \
+        if inter_dir.exists() else []
+    if inter_files:
+        links.append(link(f"Per-channel interactive views ({len(inter_files)})",
+                          inter_files[0],
+                          "each page zooms into any channel"))
+
+    for meth, sfx in (("pca", ""), ("wavelet", "_wavelet")):
+        gal = fam_dir / f"gallery{sfx}.html"
+        if gal.exists():
+            links.append(link(f"Family gallery ({meth})", gal))
+        for rep, repname in ((f"threshold_report{sfx}.txt", "threshold report"),
+                             (f"thresholds{sfx}.png", "threshold figure")):
+            p = fam_dir / rep
+            if p.exists():
+                links.append(link(f"{repname} ({meth})", p))
+    agg = fam_dir / "agreement.txt"
+    if agg.exists():
+        links.append(link("Method agreement (pca vs wavelet)", agg))
+
+    n_detail = len(list(fam_dir.glob("family*.html"))) if fam_dir.exists() else 0
+    if n_detail:
+        links.append(link(f"Family drill-down pages ({n_detail})",
+                          fam_dir / "family_0.html",
+                          "every member waveform with ch + time"))
+
+    meta = run_dir / "run_meta.json"
+    if meta.exists():
+        links.append(link("Run metadata (parameters, per-channel summary)", meta))
+
+    body = "\n".join(f"<ul>{l}</ul>" for l in links)
+    html = [
+        "<!DOCTYPE html><html><head><title>MEA analysis index</title><style>",
+        "body{font-family:Arial,sans-serif;margin:30px;background:#f5f5f5;}",
+        ".card{background:white;padding:20px;border-radius:8px;max-width:760px;",
+        "box-shadow:0 2px 4px rgba(0,0,0,0.1);}",
+        "a{color:#1f77b4;text-decoration:none;}a:hover{text-decoration:underline;}",
+        "li{margin:6px 0;}</style></head><body>",
+        f'<div class="card"><h1>MEA analysis index</h1>'
+        f"<p>Run: <code>{run_dir.name}</code></p>{body}</div></body></html>",
+    ]
+    index.write_text("\n".join(html))
+    print(f"Saved home page to: {index}")
+    return index
+
+
+def _waveform_tile(w: np.ndarray, ax) -> None:
+    """Plot one raw event waveform as a compact tile (no axes decorations)."""
+    ax.plot(w, linewidth=0.6, color="#1f77b4")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_linewidth(0.4)
+
+
+def gen_family_detail_html(run: Dict[str, Any], out_dir: Path,
+                           cid: int, tiles_per_fig: int = 96,
+                           cols: int = 12) -> None:
+    """Clickable drill-down page for ONE global family: every member waveform.
+
+    Renders all member events of global family `cid` as a grid of small
+    waveform tiles, each labelled with its channel and event time (so a shape
+    can be traced back to ch + t). Very large families are chunked into
+    multiple <img> grids on a single page. Returns nothing; writes
+    family_<cid>.html into out_dir.
+    """
+    nodes = run["components"][cid]
+    gsum = run["global_summary"][cid]
+    results = run["results"]
+
+    rows = []  # (ch, t, waveform)
+    for i in nodes:
+        f = run["families"][i]
+        d = results[f["ch"]]
+        lbl = run["channel_out"][f["ch"]]["labels"]
+        m = np.flatnonzero(lbl == f["family"])
+        for mi in m:
+            rows.append((f["ch"], float(d["spike_times"][mi]),
+                         np.asarray(d["waveforms"][mi], dtype=float)))
+
+    n = len(rows)
+    rows_sorted = sorted(rows, key=lambda r: (r[0], r[1]))  # ch, then time
+
+    img_parts = []
+    for start in range(0, n, tiles_per_fig):
+        chunk = rows_sorted[start:start + tiles_per_fig]
+        nrow = int(np.ceil(len(chunk) / cols))
+        fig, axes = plt.subplots(nrow, cols, figsize=(cols * 1.05, nrow * 0.85))
+        axes = np.atleast_2d(axes)
+        for k, (ch, t, w) in enumerate(chunk):
+            r, c = divmod(k, cols)
+            _waveform_tile(w, axes[r, c])
+            axes[r, c].set_title(f"ch{ch} t={t:.2f}s", fontsize=5, pad=1)
+        for ax in axes.ravel()[len(chunk):]:
+            ax.axis("off")
+        fig.tight_layout(pad=0.2)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=110)
+        plt.close(fig)
+        img_parts.append(f'<img src="data:image/png;base64,'
+                         f'{base64.b64encode(buf.getvalue()).decode()}" '
+                         f'style="display:block;margin:6px auto;max-width:100%;">')
+
+    chs_str = ", ".join(str(c) for c in gsum["channels"][:20])
+    if len(gsum["channels"]) > 20:
+        chs_str += ", ..."
+    sfx = suffix_of(run)
+    html = [
+        "<!DOCTYPE html><html><head><title>Family "
+        f"{cid} detail</title><style>",
+        "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5;}",
+        ".hd{background:#e8e8e8;padding:12px;border-radius:8px;}",
+        "a{color:#1f77b4;}</style></head><body>",
+        f'<div class="hd"><a href="gallery{sfx}.html">'
+        f'&larr; back to gallery</a><br>',
+        f"<h2>Family {cid} &mdash; {gsum['n_members']} events on "
+        f"{gsum['n_channels']} channels (ch {chs_str})</h2>",
+        f"<p>{n} waveforms; sorted by channel then time.</p></div>",
+        *img_parts,
+        "</body></html>",
+    ]
+    (out_dir / f"family{sfx}_{cid}.html").write_text("\n".join(html))
+
+
+def suffix_of(run: Dict[str, Any]) -> str:
+    """Filename suffix used for this run's gallery ('' for pca, '_wavelet')."""
+    return "" if run["method"] == "pca" else f"_{run['method']}"
+
+
 def gen_gallery_html(run: Dict[str, Any], out_path: Path) -> None:
     """Render one section per global family: template + (time, channel) map.
 
@@ -686,7 +845,9 @@ def gen_gallery_html(run: Dict[str, Any], out_path: Path) -> None:
         parts.append(
             f'<div class="fam"><div class="h"><strong>Family {cid}</strong> '
             f'&mdash; {gsum["n_members"]} events, {gsum["n_channels"]} channels '
-            f'(ch {chs_str})</div>'
+            f'(ch {chs_str}) &mdash; '
+            f'<a href="family{suffix_of(run)}_{cid}.html">drill-down: all '
+            f'waveforms</a></div>'
             f'<img src="data:image/png;base64,{img}"></div>')
 
     parts.append("</body></html>")
@@ -742,7 +903,7 @@ def validate_thresholds(run: Dict[str, Any], out_dir: Path,
     imgprefix = f"{suffix}" if suffix else ""
     fam = run["families"]
     T = np.vstack([f["template"] for f in fam])
-    C = np.abs(T @ T.T)
+    C = np.abs(T @ T.T)  # magnitude-weighted overlap (matches merge_templates_global)
     np.fill_diagonal(C, 0)
     n = len(fam)
     within, cross = [], []
@@ -769,8 +930,9 @@ def validate_thresholds(run: Dict[str, Any], out_dir: Path,
     n_multi = sum(1 for g in run["global_summary"] if g["n_channels"] > 1)
     stats_out["n_multi_channel_families"] = int(n_multi)
 
-    # irregular fraction vs gate multiplier (using the pca labels if present)
-    if run["method"] in ("pca", "both"):
+    # irregular fraction vs gate multiplier (works for pca AND wavelet: both
+    # store per-channel X and templates)
+    if run["method"] in ("pca", "wavelet", "both"):
         irr_curve = {}
         for mult in (1.0, 2.0, 3.0, 4.0, 5.0, 6.0):
             tot_irr = 0
@@ -796,13 +958,13 @@ def validate_thresholds(run: Dict[str, Any], out_dir: Path,
         f"criterion={run.get('criterion', '-')}",
         "",
         "MERGE THRESHOLD r_thr = %.2f" % merge_threshold,
-        "  Rationale (self-consistency): the per-channel model never treats"
-        " two families on the SAME",
-        "  channel as distinct if they correlate more than the within-channel"
-        " maximum. Merging only",
-        "  cross-channel pairs with c >= r_thr therefore never contradicts the"
+        "  Rationale (self-consistency): ideally the per-channel model never"
+        " treats two families on the",
+        "  SAME channel as distinct if they overlap more than the within-channel"
+        " maximum, so that merging",
+        "  only cross-channel pairs with c >= r_thr never contradicts the"
         " per-channel family",
-        "  definitions.",
+        "  definitions. Self-consistency holds iff within-channel max < r_thr.",
         f"  within-channel corr:  p50={q(within,50):.3f}  p90={q(within,90):.3f}  "
         f"p99={q(within,99):.3f}  max={q(within,100):.3f}",
         f"  cross-channel  corr:  p50={q(cross,50):.3f}  p90={q(cross,90):.3f}  "
@@ -917,20 +1079,40 @@ def _run_single(npz_path: Path, method: str, args: argparse.Namespace,
     suffix = "_" + method if method != "pca" else ""
     save_families(out_dir / f"families{suffix}.npz", run, npz_path)
     gen_gallery_html(run, out_dir / f"gallery{suffix}.html")
+    for cid in range(len(run["components"])):
+        gen_family_detail_html(run, out_dir, cid)
     validate_thresholds(run, out_dir, args.merge_threshold, suffix=suffix)
+    gen_home_html(out_dir.parent)
     return run
+
+
+def _latest_run_npz() -> Path:
+    """Path to the most recent raw_analysis waveforms.npz (by dir mtime).
+
+    Used as the -o default so `python spike_sorting.py` acts on the freshest
+    run without requiring the user to retype the timestamped directory.
+    """
+    root = Path("outputs")
+    candidates = sorted(root.glob("*/waveforms/waveforms.npz"),
+                        key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise SystemExit(
+            f"No waveforms.npz found under {root.resolve()}/ (run "
+            "raw_analysis.py first, or pass -o <path> explicitly).")
+    return candidates[0]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Event-waveform family discovery (fungal MEA spike sorting)",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-o", "--output", required=True,
-                        help="Path to a raw_analysis waveforms.npz")
-    parser.add_argument("--method", default="pca",
+    parser.add_argument("-o", "--output", default=None,
+                        help="Path to a raw_analysis waveforms.npz "
+                             "(default: latest run under outputs/)")
+    parser.add_argument("--method", default="both",
                         choices=["pca", "wavelet", "both"],
-                        help="Feature/clustering method (default: pca; 'both' "
-                             "runs pca and wavelet side by side + agreement)")
+                        help="Feature/clustering method (default: both; runs "
+                             "pca and wavelet side by side + agreement)")
     parser.add_argument("-L", "--length", type=int, default=DEFAULT_L,
                         help="Common resampled event length (default 128)")
     parser.add_argument("--max-components", type=int, default=DEFAULT_MAX_COMPONENTS,
@@ -957,7 +1139,7 @@ def main() -> None:
                              "(default: <waveforms run dir>/families)")
     args = parser.parse_args()
 
-    npz_path = Path(args.output)
+    npz_path = _latest_run_npz() if args.output is None else Path(args.output)
     out_dir = Path(args.out_dir) if args.out_dir else (
         npz_path.parent.parent / "families")
     if args.method == "both":

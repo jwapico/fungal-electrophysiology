@@ -17,8 +17,10 @@ multi-oscillation "events" and one waveform window is extracted per event:
   5. Event gate:            keep i iff duration >= MIN_EVENT_MS  AND
                             |v_k[m_i]| >= S * sigma_k  (S = SPIKE_GATE_SCALE),
                             m_i = argmax_{[S_i,E_i]} |v_k|  (dominant deflection).
-  6. Oscillation count:     #peaks of |v_k| on [S_i,E_i] above the gate, with
-                            >= OSCILLATION_MIN_DISTANCE (1 ms) between peaks.
+   6. Oscillation count:     count_oscillations(v_k[S_i:E_i], sigma_k):
+                             major alternating turning points (swing >=
+                             OSC_MIN_SWING_SIGMAS * sigma, spacing >=
+                             OSC_MIN_PERIOD_MS) -> ceil((K-1)/2) cycles.
   7. Window:                W_i = clip((E_i+p_post) - (S_i-p_pre) + 1,
                             MIN_WINDOW_MS, MAX_WINDOW_MS); if clipped, centered
                             on m_i; clamped to trace bounds. Peak offset
@@ -79,13 +81,17 @@ RUN_META_FILENAME: str = "run_meta.json"
 PLOTLY_JS: str = "cdn"
 
 # ---------------- event segmentation ----------------
-EVENT_NOISE_ESTIMATOR: Callable[[np.ndarray], float] = \
-    lambda x: float(1.4826 * np.median(np.abs(x - np.median(x))))  # MAD
+def estimate_noise_mad(x: np.ndarray) -> float:
+    """Robust noise scale: sigma = 1.4826 * MAD(x)."""
+    return float(1.4826 * np.median(np.abs(x - np.median(x))))
+
+EVENT_NOISE_ESTIMATOR: Callable[[np.ndarray], float] = estimate_noise_mad
 EVENT_GATE_SCALE: float = 5.0    # low envelope gate  (x noise)
-SPIKE_GATE_SCALE: float = 16.0   # high gate: an event's dominant peak must clear this
+SPIKE_GATE_SCALE: float = 7.0    # high gate: an event's dominant peak must clear this
 EVENT_GAP_MS: float = 5.0        # merge excursions <= this apart into one event
 MIN_EVENT_MS: float = 1.5        # discard envelope blips shorter than this
-OSCILLATION_MIN_DISTANCE: int = 30  # min samples between oscillation peaks (1 ms)
+OSC_MIN_SWING_SIGMAS: float = 5.0  # oscillation swing must exceed this x noise (uV)
+OSC_MIN_PERIOD_MS: float = 1.0     # min spacing between counted turning points
 
 # ---------------- window extraction ----------------
 PRE_PAD_MS: float = 2.0
@@ -159,6 +165,83 @@ def estimate_noise_mad(x: np.ndarray) -> float:
     return float(1.4826 * np.median(np.abs(x - median)))
 
 
+def count_oscillations(
+    seg: np.ndarray,
+    noise: float,
+    swing_sigmas: float = OSC_MIN_SWING_SIGMAS,
+    min_period_ms: float = OSC_MIN_PERIOD_MS,
+    sample_rate: int = SAMPLE_RATE_HZ,
+) -> int:
+    """Count the major oscillations inside one event's excursion segment.
+
+    Formal description
+    ------------------
+    Let {e_k} be the local extrema (peaks and troughs) of the segment in time
+    order, and s_k = |x[e_{k+1}] - x[e_k]| the swing between consecutive
+    extrema. A turning point is *significant* when
+
+        (i) it alternates sign with the previous significant one, and
+        (ii) its swing to that neighbour exceeds s_min = c * sigma, where
+             sigma is the channel's robust noise scale (OSC_MIN_SWING_SIGMAS
+             x sigma) and
+        (iii) it is spaced >= OSC_MIN_PERIOD_MS from the previous one.
+
+    Keeping K significant turning points, the oscillation count is
+
+        N = max(1, ceil((K - 1) / 2)),
+
+    i.e. the number of full (plus any trailing half) cycles spanned by the
+    significant turning points. Notes:
+
+      * The swing threshold is *absolute in noise units*, not a fraction of
+        the largest swing, so a single dominant deflection cannot dwarf the
+        other oscillations (the failure mode of a max-relative threshold).
+      * Requiring sign alternation prevents counting ripple that sits on a
+        plateau (e.g. tiny bumps inside a long negative dip).
+      * Counting runs over the *excursion* [onset, offset], NOT the padded
+        window, so pre/post-event baseline micro-activity is not counted.
+    """
+    x = np.asarray(seg, dtype=float)
+    if len(x) < 3:
+        return 1
+    peaks = scipy.signal.find_peaks(x)[0]
+    troughs = scipy.signal.find_peaks(-x)[0]
+    ext = sorted([(int(i), 1) for i in peaks] + [(int(i), -1) for i in troughs])
+    if not ext:
+        return 1
+    idx = np.array([e[0] for e in ext], dtype=float)
+    pol = np.array([e[1] for e in ext])
+    vals = np.array([x[e[0]] for e in ext], dtype=float)
+    s_min = swing_sigmas * noise
+    min_period = min_period_ms * sample_rate / 1000.0
+
+    # pass A: sign alternation + swing threshold
+    kept = []
+    for k in range(len(ext)):
+        if not kept:
+            kept.append(k)
+            continue
+        p = kept[-1]
+        if pol[p] == pol[k]:
+            continue
+        if abs(vals[k] - vals[p]) < s_min:
+            continue
+        kept.append(k)
+    # pass B: minimum spacing between turning points (merge the weaker swing)
+    kept_b = []
+    for k in kept:
+        if kept_b and (idx[k] - idx[kept_b[-1]]) < min_period:
+            prev_swing = (abs(vals[kept_b[-1]] - vals[kept_b[-2]])
+                          if len(kept_b) >= 2 else 1e18)
+            cur_swing = abs(vals[k] - vals[kept_b[-1]])
+            if cur_swing > prev_swing:
+                kept_b.pop()
+            else:
+                continue
+        kept_b.append(k)
+    return max(1, int(np.ceil((len(kept_b) - 1) / 2)))
+
+
 def detect_events(
     voltage: np.ndarray,
     noise_estimator: Callable[[np.ndarray], float] = EVENT_NOISE_ESTIMATOR,
@@ -166,7 +249,8 @@ def detect_events(
     spike_gate_scale: float = SPIKE_GATE_SCALE,
     gap_ms: float = EVENT_GAP_MS,
     min_event_ms: float = MIN_EVENT_MS,
-    osc_min_distance: int = OSCILLATION_MIN_DISTANCE,
+    swing_sigmas: float = OSC_MIN_SWING_SIGMAS,
+    min_period_ms: float = OSC_MIN_PERIOD_MS,
     sample_rate: int = SAMPLE_RATE_HZ,
 ) -> Tuple[List[Event], float, float, float]:
     """Segment the trace v into multi-oscillation events.
@@ -184,8 +268,10 @@ def detect_events(
            (E_i - S_i + 1) >= min_event_samples  AND
            |v[m_i]| >= spike_gate,   m_i = argmax_{n in [S_i,E_i]} |v[n]|.
        m_i is the "dominant deflection" (largest |voltage| in the event).
-    5. Oscillation count:  N_i = #{peaks of |v| on [S_i,E_i] with value >= gate
-       and pairwise distance >= osc_min_distance} (rectified-envelope peaks).
+    5. Oscillation count:  N_i = count_oscillations(v[S_i:E_i], sigma), the
+       number of major alternating turning points (swing >= OSC_MIN_SWING_SIGMAS
+       x sigma, spacing >= OSC_MIN_PERIOD_MS) halved into full cycles
+       (see count_oscillations for the formal definition).
 
     Returns:
         (events, noise, gate, spike_gate)
@@ -220,8 +306,7 @@ def detect_events(
         main = s + int(np.argmax(np.abs(seg)))
         if abs(voltage[main]) < spike_gate:
             continue
-        n_osc = len(scipy.signal.find_peaks(
-            np.abs(seg), height=gate, distance=osc_min_distance)[0])
+        n_osc = count_oscillations(seg, noise)
         events.append(Event(onset=s, offset=e, main=main, n_oscillations=n_osc))
 
     return events, noise, gate, spike_gate
@@ -294,12 +379,12 @@ def process_channel(data: np.ndarray, channel: int) -> Dict[str, Any]:
       * window_sizes   - W_i (samples)
       * peak_indices   - r_i = m_i - start_i (dominant-peak offset in window)
       * window_starts  - start_i (absolute sample index)
-      * n_oscillations - rectified-envelope peak count N_i
+      * n_oscillations - count_oscillations() result (major cycles)
       * amplitudes     - signed dominant deflection v_k[m_i]  (uV)
     """
     print(f"\nProcessing channel {channel}...")
     voltage = data[:, channel] * VOLTAGE_SCALE
-    events, noise, gate, spike_gate = detect_events(voltage=voltage, noise_estimator=estimate_noise_std)
+    events, noise, gate, spike_gate = detect_events(voltage=voltage)
     print(f"  Found {len(events)} events (gate {gate:.2f} uV, "
           f"spike gate {spike_gate:.2f} uV, noise {noise:.2f} uV)")
 
@@ -822,7 +907,10 @@ def _write_run_meta(run_dir: Path, args: argparse.Namespace,
             "spike_gate_scale": SPIKE_GATE_SCALE,
             "event_gap_ms": EVENT_GAP_MS,
             "min_event_ms": MIN_EVENT_MS,
-            "oscillation_min_distance_samples": OSCILLATION_MIN_DISTANCE,
+            "osc_min_swing_sigmas": OSC_MIN_SWING_SIGMAS,
+            "osc_min_period_ms": OSC_MIN_PERIOD_MS,
+            "noise_estimator": EVENT_NOISE_ESTIMATOR.__name__ if hasattr(
+                EVENT_NOISE_ESTIMATOR, "__name__") else "lambda(MAD)",
             "pre_pad_ms": PRE_PAD_MS,
             "post_pad_ms": POST_PAD_MS,
             "min_window_ms": MIN_WINDOW_MS,
