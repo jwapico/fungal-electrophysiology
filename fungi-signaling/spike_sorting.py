@@ -91,7 +91,7 @@ from sklearn.decomposition import PCA
 from sklearn.mixture import GaussianMixture
 from sklearn.neighbors import NearestNeighbors
 
-from raw_analysis import SAMPLE_RATE_HZ, load_waveforms
+from raw_analysis import SAMPLE_RATE_HZ, OUTPUT_ROOT, WAVEFORM_REL_PATH, load_waveforms
 
 # ---------------------------------------------------------------------------
 # default hyper-parameters
@@ -921,16 +921,32 @@ def _run_single(npz_path: Path, method: str, args: argparse.Namespace,
     return run
 
 
+def _latest_waveforms_npz() -> Path:
+    """Most recent raw_analysis run's waveforms.npz, by timestamped run dir.
+
+    Runs live under <OUTPUT_ROOT>/<YYYY-MM-DD_HH-MM-SS>/waveforms/waveforms.npz
+    and the run dir names sort lexicographically in chronological order, so
+    the last match is the most recent run.
+    """
+    matches = sorted(Path(OUTPUT_ROOT).glob(f"*/{WAVEFORM_REL_PATH}"))
+    if not matches:
+        raise SystemExit(
+            f"No runs found under {Path(OUTPUT_ROOT)!s}; run raw_analysis.py "
+            "first or pass -o <waveforms.npz>")
+    return matches[-1]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Event-waveform family discovery (fungal MEA spike sorting)",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-o", "--output", required=True,
-                        help="Path to a raw_analysis waveforms.npz")
-    parser.add_argument("--method", default="pca",
+    parser.add_argument("-o", "--output", default=None,
+                        help="Path to a raw_analysis waveforms.npz "
+                             "(default: most recent run)")
+    parser.add_argument("--method", default="both",
                         choices=["pca", "wavelet", "both"],
-                        help="Feature/clustering method (default: pca; 'both' "
-                             "runs pca and wavelet side by side + agreement)")
+                        help="Feature/clustering method (default: both; runs "
+                             "pca and wavelet side by side + agreement)")
     parser.add_argument("-L", "--length", type=int, default=DEFAULT_L,
                         help="Common resampled event length (default 128)")
     parser.add_argument("--max-components", type=int, default=DEFAULT_MAX_COMPONENTS,
@@ -957,7 +973,7 @@ def main() -> None:
                              "(default: <waveforms run dir>/families)")
     args = parser.parse_args()
 
-    npz_path = Path(args.output)
+    npz_path = Path(args.output) if args.output else _latest_waveforms_npz()
     out_dir = Path(args.out_dir) if args.out_dir else (
         npz_path.parent.parent / "families")
     if args.method == "both":
