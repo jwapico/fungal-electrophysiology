@@ -21,12 +21,14 @@ multi-oscillation "events" and one waveform window is extracted per event:
                              #major alternating turning points (swing >=
                              OSC_MIN_SWING_SIGMAS * sigma, spacing >=
                              OSC_MIN_PERIOD_MS) -> ceil((K-1)/2) cycles.
-  7. Window:                W_i = (E_i-S_i+1) + 2*PAD_FRACTION*(E_i-S_i+1),
+  7. Window:                W_i = (E_i-S_i+1) + 2*pad, with
+                             pad = max(PAD_FRACTION*(E_i-S_i+1), MIN_PAD_S*fs),
                              i.e. symmetric padding proportional to the
-                             excursion length; clamped to MIN_WINDOW_MS but
-                             NOT to an upper bound (no max clipping). The
-                             window is aligned on the excursion (start at
-                             S_i - pre), with peak offset r_i = m_i - start_i.
+                             excursion length but never less than MIN_PAD_S on
+                             each side; clamped to MIN_WINDOW_MS but NOT to an
+                             upper bound (no max clipping). The window is
+                             aligned on the excursion (start at S_i - pre),
+                             with peak offset r_i = m_i - start_i.
 
 Output layout: each run writes into its own timestamped directory
    outputs/<YYYY-MM-DD_HH-MM-SS>/
@@ -88,23 +90,26 @@ EVENT_NOISE_ESTIMATOR: Callable[[np.ndarray], float] = \
 EVENT_GATE_SCALE: float = 5.0    # low envelope gate  (x noise)
 SPIKE_GATE_SCALE: float = 4.0   # high gate: an event's dominant peak must clear this
 EVENT_GAP_MS: float = 5.0        # merge excursions <= this apart into one event
-MIN_EVENT_MS: float = 1.5        # discard envelope blips shorter than this
+MIN_EVENT_MS: float = 0.5        # discard envelope blips shorter than this
 OSC_MIN_SWING_SIGMAS: float = 5.0  # oscillation swing must exceed this x noise (uV)
 OSC_MIN_PERIOD_MS: float = 1.0     # min spacing between counted turning points
 
 # ---------------- window extraction ----------------
 EXTENT_SIGMAS: float = 2.0   # window base = contiguous span where |v| > this x noise
-PAD_FRACTION: float = 1.0      # pre/post pad = this fraction of the extent length
+PAD_FRACTION: float = 0.25      # pre/post pad = this fraction of the extent length
+MIN_PAD_S: float = 0.02        # floor on the pre/post pad (seconds): the window
+                               # always extends at least this far each side, even
+                               # when the proportional pad would be smaller
 MIN_WINDOW_MS: float = 3.0
 
 # ---------------- visualization ----------------
 CHANNEL_DS_FACTOR: int = 10
-MAX_WAVEFORMS_PER_CHANNEL: int = 200
+SPIKE_WINDOWS_LIMIT: int = 50  # default # of waveform tiles shown per channel in
+                               # the grid; a page toggle reveals all of them
 WAVEFORMS_PER_ROW: int = 6
 FIGURE_DPI: int = 80
 TILE_DPI: int = 120          # dpi of the per-event grid tiles
 TRACE_DPI: int = 100
-RANDOM_SEED: int = 0
 
 INTERACTIVE_OVERVIEW_DS: int = 200
 INTERACTIVE_SPIKE_DS: int = 4
@@ -315,6 +320,7 @@ def extract_event_window(
     noise: float,
     extent_sigmas: float = EXTENT_SIGMAS,
     pad_fraction: float = PAD_FRACTION,
+    min_pad_s: float = MIN_PAD_S,
     min_window_ms: float = MIN_WINDOW_MS,
     sample_rate: int = SAMPLE_RATE_HZ,
 ) -> Optional[Tuple[np.ndarray, float, int, int, int]]:
@@ -332,13 +338,15 @@ def extract_event_window(
     the detection gate but are still part of the event.
 
     The pad is proportional to the extent (adaptive: small spikes get small
-    margins, large spikes get large ones):
+    margins, large spikes get large ones) but never below a floor:
 
-        pre = post = round(PAD_FRACTION * L_ext),   L_ext = R_i - L_i + 1.
+        pre = post = max(round(PAD_FRACTION * L_ext), round(MIN_PAD_S * fs)),
+        L_ext = R_i - L_i + 1.
 
     The natural window spans
 
-        W_nat = L_ext + pre + post = (1 + 2*PAD_FRACTION) * L_ext.
+        W_nat = L_ext + pre + post
+              = L_ext + 2*max(round(PAD_FRACTION*L_ext), round(MIN_PAD_S*fs)).
 
     The extracted size is
 
@@ -368,7 +376,8 @@ def extract_event_window(
         extent_e += 1
     extent_len = extent_e - extent_s + 1
 
-    pad = int(round(pad_fraction * extent_len))
+    pad = max(int(round(pad_fraction * extent_len)),
+              int(round(min_pad_s * sample_rate)))
     min_w = int(min_window_ms * sample_rate / 1000)
 
     natural_w = extent_len + 2 * pad
@@ -510,6 +519,7 @@ def save_waveforms(results: Dict[int, Dict[str, Any]],
         "unit": "uV",
         "source_file": source_file,
         "min_window_ms": MIN_WINDOW_MS,
+        "min_pad_s": MIN_PAD_S,
         "pad_fraction": PAD_FRACTION,
         "extent_sigmas": EXTENT_SIGMAS,
         "event_gate_scale": EVENT_GATE_SCALE,
@@ -623,7 +633,7 @@ def _tile_figure(waveform: np.ndarray, start_idx: int, peak_idx: int,
     ax.set_ylim(ymin - 0.05 * (ymax - ymin), ymax + 0.05 * (ymax - ymin))
     ax.tick_params(labelsize=5, length=2)
     ax.set_xticks([t[0], t[-1]])
-    ax.set_xticklabels([f"{t[0]:.2f}", f"{t[-1]:.2f}"], fontsize=5)
+    ax.set_xticklabels([f"{t[0]:.4f}", f"{t[-1]:.4f}"], fontsize=5)
     ax.text(0.985, 0.985, f"{n_osc} osc", transform=ax.transAxes,
             ha="right", va="top", fontsize=6, color="#555")
     fig.tight_layout(pad=0.15)
@@ -634,7 +644,7 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
                             output_file: str,
                             interactive_pattern: str = INTERACTIVE_HTML_PATTERN,
                             interactive_dir: str = INTERACTIVE_HTML_DIR,
-                            max_waveforms: int = MAX_WAVEFORMS_PER_CHANNEL,
+                            spike_windows_limit: int = SPIKE_WINDOWS_LIMIT,
                             dpi: int = TILE_DPI,
                             context_ms: float = INTERACTIVE_CONTEXT_MS) -> None:
     """Render the flex CSS-grid of per-event tiles, one tile per waveform.
@@ -643,11 +653,28 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
     <a> that deep-links to the channel's interactive view zoomed on that
     event. The grid uses CSS auto-fill so tiles reflow with the browser
     width (responsive/flex layout); no image maps are needed.
+
+    ALL extracted windows are rendered; a checkbox (checked by default)
+    applies a CSS class that hides every tile beyond the first
+    `spike_windows_limit` per channel, and unchecking it reveals all of
+    them. The limit value is injected into the CSS from the module constant
+    SPIKE_WINDOWS_LIMIT, so the visible cutoff always follows the code.
     """
     print(f"\nGenerating waveform grid HTML: {output_file}")
-    rng = np.random.default_rng(RANDOM_SEED)
 
     html_parts = _html_head("MEA Spike Waveform Grid")
+    html_parts.append(f"""
+    <style>
+        .limit-toggle {{ margin: 12px 0 18px 0; font-size: 13px; color: #333; }}
+        .spike-tiles .tile:nth-child(n+{spike_windows_limit + 1}) {{ display: none; }}
+        body.show-all .spike-tiles .tile:nth-child(n+{spike_windows_limit + 1}) {{ display: block; }}
+    </style>
+    <div class="limit-toggle">
+        <label><input type="checkbox" id="limit-toggle" checked
+            onchange="document.body.classList.toggle('show-all', !this.checked)">
+            Limit to the first <strong>{spike_windows_limit}</strong> windows per channel
+            (uncheck to show all)</label>
+    </div>""")
     html_parts.append("    <p>Every extracted event window, per channel. "
                       "x-axis is absolute recording time (s); the red dotted "
                       "lines mark the window min/max voltage; the dashed line "
@@ -665,22 +692,15 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
         peak_pos = data["peak_indices"]
         starts = data["window_starts"]
         n_osc = data["n_oscillations"]
-
-        if len(waveforms) > max_waveforms:
-            sel = np.sort(rng.choice(len(waveforms), max_waveforms, replace=False))
-        else:
-            sel = np.arange(len(waveforms))
-        sub_wf = [waveforms[i] for i in sel]
-        sub_peak = peak_pos[sel]
-        sub_start = starts[sel]
-        sub_osc = n_osc[sel]
+        env_gate = EVENT_GATE_SCALE * data["std_dev"]
+        spk_gate = SPIKE_GATE_SCALE * data["std_dev"]
 
         tiles = []
-        for j, wf in enumerate(sub_wf):
-            fig = _tile_figure(wf, int(sub_start[j]), int(sub_peak[j]),
-                               int(sub_osc[j]))
+        for j, wf in enumerate(waveforms):
+            fig = _tile_figure(wf, int(starts[j]), int(peak_pos[j]),
+                               int(n_osc[j]))
             img = _figure_to_base64(fig, dpi=dpi, tight=False)
-            t = float(times[sel[j]])
+            t = float(times[j])
             margin = (len(wf) / (2.0 * SAMPLE_RATE_HZ) + context_ms / 1000.0)
             t0 = max(0.0, t - margin)
             t1 = t + margin
@@ -688,9 +708,9 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
                     f"?t0={t0:.4f}&t1={t1:.4f}")
             tiles.append(
                 f'        <a class="tile" href="{href}" target="_blank" '
-                f'title="ch{ch} event t={t:.3f}s, {int(sub_osc[j])} osc">\n'
+                f'title="ch{ch} event t={t:.4f}s, {int(n_osc[j])} osc">\n'
                 f'          <img src="data:image/png;base64,{img}" '
-                f'alt="ch{ch} t={t:.3f}s">\n'
+                f'alt="ch{ch} t={t:.4f}s">\n'
                 f'        </a>')
 
         html_parts.append(f"""
@@ -700,11 +720,12 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
                 <div class="stats">
                     <strong>Events:</strong> {data['n_events']} |
                     <strong>Extracted:</strong> {data['n_extracted']} |
-                    <strong>Spike gate:</strong> {data['threshold']:.2f} uV |
+                    <strong>Envelope gate ({EVENT_GATE_SCALE:.0f}x noise):</strong> {env_gate:.2f} uV |
+                    <strong>Spike gate ({SPIKE_GATE_SCALE:.0f}x noise):</strong> {spk_gate:.2f} uV |
                     <strong>Noise (MAD):</strong> {data['std_dev']:.2f} uV
                 </div>
             </div>
-            <div class="tile-grid">
+            <div class="spike-tiles tile-grid">
 {chr(10).join(tiles)}
             </div>
         </div>
@@ -720,14 +741,16 @@ def gen_channel_html(results: Dict[int, Dict[str, Any]],
     """Render one full-trace figure per channel (downsampled overview).
 
     The trace is decimated by CHANNEL_DS_FACTOR (y -> y[::ds]) for a light
-    PNG; detected dominant peaks are overlaid as red dots and the spike gate
-    as a dashed line. Purely visual, no analysis.
+    PNG; detected dominant peaks are overlaid as red dots and the two gates
+    (envelope gate = EVENT_GATE_SCALE x noise, spike gate = SPIKE_GATE_SCALE
+    x noise, both derived from the module constants) are drawn as dashed
+    lines. Purely visual, no analysis.
     """
     print(f"\nGenerating full-trace HTML: {output_file}")
     data = load_raw_data(raw_file)
     html_parts = _html_head("MEA Channel Traces")
     html_parts.append("    <p>Full recording per channel with detected "
-                      "events marked (spike gate shown dashed).</p>")
+                      "events marked (envelope and spike gates shown dashed).</p>")
 
     for ch in sorted(results.keys()):
         res = results[ch]
@@ -741,13 +764,26 @@ def gen_channel_html(results: Dict[int, Dict[str, Any]],
         peak_times = abs_peaks / SAMPLE_RATE_HZ
         peak_voltages = voltage[abs_peaks]
 
+        env_gate = EVENT_GATE_SCALE * res["std_dev"]
+        spk_gate = SPIKE_GATE_SCALE * res["std_dev"]
+
         fig, ax = plt.subplots(figsize=(14, 3))
         ax.plot(time_ds, voltage_ds, color="blue", linewidth=0.4)
         ax.scatter(peak_times, peak_voltages, s=6, c="red", zorder=3)
-        ax.axhline(res["threshold"], color="orange", linewidth=0.8,
-                   linestyle="--", alpha=0.8)
+        ax.axhline(env_gate, color="orange", linewidth=0.9, linestyle="--",
+                   alpha=0.8, label=f"{EVENT_GATE_SCALE:.0f}x-noise envelope gate "
+                                    f"({env_gate:.2f} uV)")
+        ax.axhline(-env_gate, color="orange", linewidth=0.9, linestyle="--",
+                   alpha=0.8)
+        ax.axhline(spk_gate, color="purple", linewidth=0.7, linestyle=":",
+                   alpha=0.8, label=f"{SPIKE_GATE_SCALE:.0f}x-noise spike gate "
+                                    f"({spk_gate:.2f} uV)")
+        ax.axhline(-spk_gate, color="purple", linewidth=0.7, linestyle=":",
+                   alpha=0.8)
+        ax.legend(fontsize=7, loc="upper right")
         ax.set_title(f"Channel {ch} - {res['n_extracted']} events "
-                     f"(spike gate: {res['threshold']:.2f} uV)")
+                     f"(envelope gate: {env_gate:.2f} uV, "
+                     f"spike gate: {spk_gate:.2f} uV)")
         ax.set_xlabel("Time (seconds)")
         ax.set_ylabel("Voltage (uV)")
         fig.tight_layout()
@@ -759,7 +795,8 @@ def gen_channel_html(results: Dict[int, Dict[str, Any]],
                 <div class="stats">
                     <strong>Events:</strong> {res['n_events']} |
                     <strong>Extracted:</strong> {res['n_extracted']} |
-                    <strong>Spike gate:</strong> {res['threshold']:.2f} uV |
+                    <strong>Envelope gate ({EVENT_GATE_SCALE:.0f}x noise):</strong> {env_gate:.2f} uV |
+                    <strong>Spike gate ({SPIKE_GATE_SCALE:.0f}x noise):</strong> {spk_gate:.2f} uV |
                     <strong>Noise (MAD):</strong> {res['std_dev']:.2f} uV
                 </div>
             </div>
@@ -830,9 +867,18 @@ def gen_channel_interactive_html(results: Dict[int, Dict[str, Any]],
                              marker=dict(color="red", size=7, symbol="x"),
                              hovertemplate="t=%{x:.3f}s<br>%{y:.1f}uV"))
 
+    env_gate = EVENT_GATE_SCALE * res["std_dev"]
+    spk_gate = SPIKE_GATE_SCALE * res["std_dev"]
+    fig.add_hline(y=env_gate, line_color="orange", line_width=1, line_dash="dash",
+                  name=f"{EVENT_GATE_SCALE:.0f}x-noise envelope gate", showlegend=True)
+    fig.add_hline(y=-env_gate, line_color="orange", line_width=1, line_dash="dash")
+    fig.add_hline(y=spk_gate, line_color="purple", line_width=1, line_dash="dot",
+                  name=f"{SPIKE_GATE_SCALE:.0f}x-noise spike gate", showlegend=True)
+    fig.add_hline(y=-spk_gate, line_color="purple", line_width=1, line_dash="dot")
+
     fig.update_layout(
         title=f"Channel {channel} - {res['n_extracted']} events "
-              f"(spike gate {res['threshold']:.2f} uV)",
+              f"(envelope gate {env_gate:.2f} uV, spike gate {spk_gate:.2f} uV)",
         xaxis_title="Time (seconds)", yaxis_title="Voltage (uV)",
         template="plotly_white",
         margin=dict(l=40, r=20, t=60, b=40),
@@ -928,6 +974,7 @@ def _write_run_meta(run_dir: Path, args: argparse.Namespace,
             "osc_min_swing_sigmas": OSC_MIN_SWING_SIGMAS,
             "osc_min_period_ms": OSC_MIN_PERIOD_MS,
             "pad_fraction": PAD_FRACTION,
+            "min_pad_s": MIN_PAD_S,
             "min_window_ms": MIN_WINDOW_MS,
             "extent_sigmas": EXTENT_SIGMAS,
         },
