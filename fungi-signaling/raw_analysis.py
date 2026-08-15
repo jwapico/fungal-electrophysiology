@@ -116,6 +116,16 @@ INTERACTIVE_SPIKE_DS: int = 4
 SPIKE_CONTEXT_MS: float = 200.0
 INTERACTIVE_CONTEXT_MS: float = 100.0
 
+# ---------------- display-only waveform smoothing ----------------
+# Applied ONLY when rendering the waveform-grid tiles (see
+# smooth_waveform()); the persisted waveforms are never modified, so the
+# raw tiles always match the saved data exactly. Zero-phase by construction
+# (symmetric Savitzky-Golay fit), so peak locations never shift.
+SMOOTH_METHOD: str = "savgol"              # "savgol" | "none"
+SMOOTH_WINDOW_MS: float = 4.0              # savgol window width (approx, forced odd)
+SMOOTH_POLYORDER: int = 4                  # savgol polynomial order
+SMOOTH_SHOW_BY_DEFAULT: bool = False       # grid checkbox state (raw is the truth)
+
 
 class Event(NamedTuple):
     onset: int
@@ -607,8 +617,39 @@ def _figure_to_base64(fig: Figure, dpi: int = FIGURE_DPI,
     return img
 
 
+def smooth_waveform(waveform: np.ndarray,
+                    method: str = SMOOTH_METHOD,
+                    window_ms: float = SMOOTH_WINDOW_MS,
+                    polyorder: int = SMOOTH_POLYORDER,
+                    sample_rate: int = SAMPLE_RATE_HZ) -> np.ndarray:
+    """Zero-phase, shape-preserving smoothing for DISPLAY ONLY.
+
+    Savitzky-Golay: for every sample, fit a least-squares polynomial of
+    degree `polyorder` to the symmetric window around it and take the
+    fitted value at the center. The kernel is symmetric, so the filter is
+    zero-phase by construction: peak locations cannot shift. The polynomial
+    fit tracks the smooth macro deflection and discards high-frequency
+    noise, keeping peak amplitudes ~intact (a moving average or FIR low-pass
+    would flatten peaks and round corners).
+
+    The returned array is a new smoothed copy; it is never written back to
+    the saved waveforms, so the raw tiles always equal the persisted data.
+    `method == "none"` returns the input unchanged.
+    """
+    if method != "savgol":
+        return waveform
+    win = int(round(window_ms * sample_rate / 1000)) | 1  # force odd
+    win = max(win, polyorder + 1)
+    if win % 2 == 0:
+        win += 1
+    if win < 3 or win >= len(waveform):
+        return waveform
+    return scipy.signal.savgol_filter(waveform, win, polyorder)
+
+
 def _tile_figure(waveform: np.ndarray, start_idx: int, peak_idx: int,
-                 n_osc: int, sample_rate: int = SAMPLE_RATE_HZ) -> Figure:
+                 n_osc: int, sample_rate: int = SAMPLE_RATE_HZ,
+                 ylim: Optional[Tuple[float, float]] = None) -> Figure:
     """Build one small tile figure for a single event window.
 
     Axes:
@@ -625,7 +666,8 @@ def _tile_figure(waveform: np.ndarray, start_idx: int, peak_idx: int,
     ax.plot(t, waveform, linewidth=0.7, color="#1f77b4")
     ax.axvline((start_idx + peak_idx) / sample_rate, color="k",
                linewidth=0.5, alpha=0.5, linestyle="--")
-    ymin, ymax = float(waveform.min()), float(waveform.max())
+    ymin, ymax = (float(ylim[0]), float(ylim[1])) if ylim is not None \
+        else (float(waveform.min()), float(waveform.max()))
     for yv in (ymin, ymax):
         ax.axhline(yv, color="#d62728", linewidth=0.4, alpha=0.6, linestyle=":")
     ax.set_yticks([ymin, ymax])
@@ -663,24 +705,34 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
     print(f"\nGenerating waveform grid HTML: {output_file}")
 
     html_parts = _html_head("MEA Spike Waveform Grid")
+    smooth_checked = "checked" if SMOOTH_SHOW_BY_DEFAULT else ""
     html_parts.append(f"""
     <style>
         .limit-toggle {{ margin: 12px 0 18px 0; font-size: 13px; color: #333; }}
         .spike-tiles .tile:nth-child(n+{spike_windows_limit + 1}) {{ display: none; }}
         body.show-all .spike-tiles .tile:nth-child(n+{spike_windows_limit + 1}) {{ display: block; }}
+        .spike-tiles .tile img.smooth {{ display: none; }}
+        body.show-smooth .spike-tiles .tile img.raw {{ display: none; }}
+        body.show-smooth .spike-tiles .tile img.smooth {{ display: block; }}
     </style>
     <div class="limit-toggle">
         <label><input type="checkbox" id="limit-toggle" checked
             onchange="document.body.classList.toggle('show-all', !this.checked)">
             Limit to the first <strong>{spike_windows_limit}</strong> windows per channel
             (uncheck to show all)</label>
+        &nbsp;&nbsp;|&nbsp;&nbsp;
+        <label><input type="checkbox" id="smooth-toggle" {smooth_checked}
+            onchange="document.body.classList.toggle('show-smooth', this.checked)">
+            Show smoothed ({SMOOTH_METHOD}, {SMOOTH_WINDOW_MS:.2f} ms window, poly {SMOOTH_POLYORDER})</label>
     </div>""")
     html_parts.append("    <p>Every extracted event window, per channel. "
                       "x-axis is absolute recording time (s); the red dotted "
                       "lines mark the window min/max voltage; the dashed line "
                       "is the dominant peak; the corner number is the computed "
                       "oscillation count. Click a tile to open the channel's "
-                      "interactive view zoomed to that event.</p>")
+                      "interactive view zoomed to that event. The raw tile "
+                      "always shows the exact persisted waveform; smoothing is "
+                      "a display-only zero-phase Savitzky-Golay view.</p>")
 
     for ch in sorted(results.keys()):
         data = results[ch]
@@ -697,9 +749,13 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
 
         tiles = []
         for j, wf in enumerate(waveforms):
+            ylim = (float(wf.min()), float(wf.max()))
             fig = _tile_figure(wf, int(starts[j]), int(peak_pos[j]),
-                               int(n_osc[j]))
-            img = _figure_to_base64(fig, dpi=dpi, tight=False)
+                               int(n_osc[j]), ylim=ylim)
+            img_raw = _figure_to_base64(fig, dpi=dpi, tight=False)
+            fig = _tile_figure(smooth_waveform(wf), int(starts[j]),
+                               int(peak_pos[j]), int(n_osc[j]), ylim=ylim)
+            img_smooth = _figure_to_base64(fig, dpi=dpi, tight=False)
             t = float(times[j])
             margin = (len(wf) / (2.0 * SAMPLE_RATE_HZ) + context_ms / 1000.0)
             t0 = max(0.0, t - margin)
@@ -709,8 +765,10 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
             tiles.append(
                 f'        <a class="tile" href="{href}" target="_blank" '
                 f'title="ch{ch} event t={t:.4f}s, {int(n_osc[j])} osc">\n'
-                f'          <img src="data:image/png;base64,{img}" '
-                f'alt="ch{ch} t={t:.4f}s">\n'
+                f'          <img class="raw" src="data:image/png;base64,{img_raw}" '
+                f'alt="ch{ch} t={t:.4f}s (raw)">\n'
+                f'          <img class="smooth" src="data:image/png;base64,{img_smooth}" '
+                f'alt="ch{ch} t={t:.4f}s (smoothed)">\n'
                 f'        </a>')
 
         html_parts.append(f"""
@@ -977,6 +1035,9 @@ def _write_run_meta(run_dir: Path, args: argparse.Namespace,
             "min_pad_s": MIN_PAD_S,
             "min_window_ms": MIN_WINDOW_MS,
             "extent_sigmas": EXTENT_SIGMAS,
+            "smooth_method": SMOOTH_METHOD,
+            "smooth_window_ms": SMOOTH_WINDOW_MS,
+            "smooth_polyorder": SMOOTH_POLYORDER,
         },
         "channels": per_channel,
         "totals": {
