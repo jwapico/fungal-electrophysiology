@@ -69,6 +69,8 @@ Run (from fungi-signaling/):
     python spike_sorting.py -o outputs/<ts>/waveforms/waveforms.npz
     python spike_sorting.py -o outputs/<ts>/waveforms/waveforms.npz --method wavelet
     python spike_sorting.py -o outputs/<ts>/waveforms/waveforms.npz --method both
+    python spike_sorting.py -o outputs/<ts>/waveforms/waveforms.npz --smooth-ms 4
+    python spike_sorting.py -o outputs/<ts>/waveforms/waveforms.npz --smooth-ms 0  # raw
 """
 from __future__ import annotations
 
@@ -107,6 +109,8 @@ DEFAULT_EPS: Optional[float] = None  # DBSCAN eps; None -> k-distance heuristic
 DEFAULT_MERGE_THRESHOLD: float = 0.85  # |cos(tau_a, tau_b)| above which per-channel families merge
 TEMPLATE_GATE_MULT: float = 3.0      # irregular bucket: distance > 3 sigma_tau
 RANDOM_SEED: int = 0
+DEFAULT_SMOOTH_MS: float = 4.0       # Savitzky-Golay width (ms) applied to each
+                                     # event window before standardization
 
 
 def standardize_waveforms(waveforms: List[np.ndarray], L: int = DEFAULT_L
@@ -354,8 +358,9 @@ def select_non_gaussian_features(F: np.ndarray,
         x = F[:, j]
         x = x[np.isfinite(x)]
         if x.size >= 8 and x.std() > 0:
-            scores[j] = float(stats.anderson(x, dist="norm",
-                                             method="interpolate").statistic)
+            scores[j] = float(getattr(stats.anderson(x, dist="norm",
+                                                    method="interpolate"),
+                                    "statistic"))
     sel = np.argsort(scores)[::-1][:n_feat]
     Z = F[:, sel]
     sd = Z.std(axis=0)
@@ -479,6 +484,23 @@ def _event_index(results: Dict[int, Dict[str, Any]]) -> List[int]:
     return [ch for ch in sorted(results.keys()) if results[ch]["n_extracted"] > 0]
 
 
+def _sorting_waveforms(channel_data: Dict[str, Any],
+                       smooth_ms: Optional[float]) -> List[np.ndarray]:
+    """The per-event windows to sort on.
+
+    With smooth_ms set, prefers the channel's persisted smoothed arrays for
+    that width (raw_analysis.py's load_waveforms builds "smooth_waveforms" as
+    {width_ms: [arrays]}); falls back to the raw windows when the channel
+    predates smoothing or the width is missing.
+    """
+    if smooth_ms is None:
+        return channel_data["waveforms"]
+    smooth = channel_data.get("smooth_waveforms")
+    if smooth is not None and float(smooth_ms) in smooth:
+        return smooth[float(smooth_ms)]
+    return channel_data["waveforms"]
+
+
 def run_sorting(npz_path: str, method: str, L: int = DEFAULT_L,
                 merge_threshold: float = DEFAULT_MERGE_THRESHOLD,
                 max_components: int = DEFAULT_MAX_COMPONENTS,
@@ -487,8 +509,15 @@ def run_sorting(npz_path: str, method: str, L: int = DEFAULT_L,
                 n_feat: int = DEFAULT_N_FEATURES,
                 min_samples: int = DEFAULT_MIN_SAMPLES,
                 eps: Optional[float] = DEFAULT_EPS,
+                smooth_ms: Optional[float] = None,
                 ) -> Dict[str, Any]:
     """Execute the full per-channel -> cross-channel sorting pipeline.
+
+    When smooth_ms is given (e.g. 4.0 for the 4 ms Savitzky-Golay width), each
+    event window is smoothed with that width before standardization, so shape
+    families are discovered from the smoothed waveform (less high-frequency
+    noise) rather than the raw window. The archive's persisted smoothed arrays
+    are used; channels that predate smoothing fall back to their raw windows.
 
     Returns a result dict holding, for every channel: the cluster labels
     (aligned with the channel's event arrays), templates, descriptors, and
@@ -503,7 +532,8 @@ def run_sorting(npz_path: str, method: str, L: int = DEFAULT_L,
 
     for ch in channels:
         d = results[ch]
-        X, norms = standardize_waveforms(d["waveforms"], L)
+        waveforms = _sorting_waveforms(d, smooth_ms)
+        X, norms = standardize_waveforms(waveforms, L)
         M = X.shape[0]
         if M < 3:
             # too few events to cluster reliably; all treated as irregular
@@ -544,8 +574,8 @@ def run_sorting(npz_path: str, method: str, L: int = DEFAULT_L,
             "norms": norms, "info": info, "families": fam_desc, "X": X,
         }
         print(f"  ch{ch}: {M} events -> {info['n_clusters']} families "
-              f"({int((labels < 0).sum())} irregular), {method}")
-
+              f"({int((labels < 0).sum())} irregular), {method}"
+              f"{'' if smooth_ms is None else f', {smooth_ms}ms smoothed'}")
     # cross-channel merge
     components, node_to_global = merge_templates_global(families, merge_threshold)
     for i, f in enumerate(families):
@@ -577,7 +607,7 @@ def run_sorting(npz_path: str, method: str, L: int = DEFAULT_L,
 
     return {
         "method": method, "L": L, "merge_threshold": merge_threshold,
-        "criterion": criterion,
+        "criterion": criterion, "smooth_ms": smooth_ms,
         "channels": channels, "channel_out": channel_out,
         "families": families, "components": components,
         "global_summary": global_summary, "global_event_ids": global_event_ids,
@@ -608,6 +638,7 @@ def save_families(out_path: Path, run: Dict[str, Any], npz_path: Path) -> None:
         "labels": labels, "global_event_ids": glob_ids, "templates": templates,
         "method": run["method"], "L": run["L"],
         "criterion": run.get("criterion", ""),
+        "smooth_ms": run.get("smooth_ms"),
         "merge_threshold": run["merge_threshold"],
         "source_waveforms": str(npz_path),
         "sample_rate": SAMPLE_RATE_HZ,
@@ -699,6 +730,7 @@ def report(run: Dict[str, Any]) -> None:
     print("\n" + "=" * 64)
     print(f"Sorting summary  [method={run['method']}, L={run['L']}, "
           f"criterion={run.get('criterion', '-')}, "
+          f"smooth={run.get('smooth_ms')}ms, "
           f"merge_threshold={run['merge_threshold']}]")
     print("=" * 64)
     for g in run["global_summary"]:
@@ -793,7 +825,8 @@ def validate_thresholds(run: Dict[str, Any], out_dir: Path,
         "THRESHOLD VALIDATION REPORT (spike_sorting.py)",
         "=" * 64,
         f"method={run['method']}, L={run['L']}, "
-        f"criterion={run.get('criterion', '-')}",
+        f"criterion={run.get('criterion', '-')}, "
+        f"smooth_ms={run.get('smooth_ms')}",
         "",
         "MERGE THRESHOLD r_thr = %.2f" % merge_threshold,
         "  Rationale (self-consistency): the per-channel model never treats"
@@ -912,7 +945,8 @@ def _run_single(npz_path: Path, method: str, args: argparse.Namespace,
         max_components=args.max_components, criterion=args.criterion,
         wavelet=args.wavelet,
         level=args.level, n_feat=args.n_features,
-        min_samples=args.min_samples, eps=args.eps)
+        min_samples=args.min_samples, eps=args.eps,
+        smooth_ms=args.smooth_ms)
     report(run)
     suffix = "_" + method if method != "pca" else ""
     save_families(out_dir / f"families{suffix}.npz", run, npz_path)
@@ -965,6 +999,10 @@ def main() -> None:
                         help="DBSCAN min_samples (wavelet method)")
     parser.add_argument("--eps", type=float, default=DEFAULT_EPS,
                         help="DBSCAN eps; default = k-distance heuristic")
+    parser.add_argument("--smooth-ms", type=float, default=DEFAULT_SMOOTH_MS,
+                        help="Savitzky-Golay width (ms) applied to each event "
+                             "window before standardization (default 4.0; "
+                             "pass 0 to sort the raw windows)")
     parser.add_argument("--merge-threshold", type=float, default=DEFAULT_MERGE_THRESHOLD,
                         help="Template correlation threshold for cross-channel "
                               "merge (default 0.85)")
@@ -976,6 +1014,7 @@ def main() -> None:
     npz_path = Path(args.output) if args.output else _latest_waveforms_npz()
     out_dir = Path(args.out_dir) if args.out_dir else (
         npz_path.parent.parent / "families")
+    args.smooth_ms = None if (args.smooth_ms or 0) <= 0 else args.smooth_ms
     if args.method == "both":
         run_pca = _run_single(npz_path, "pca", args, out_dir)
         run_wav = _run_single(npz_path, "wavelet", args, out_dir)

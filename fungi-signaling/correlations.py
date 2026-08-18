@@ -46,11 +46,13 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, cast
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.colors
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 import numpy as np
 from PIL import Image
@@ -192,12 +194,15 @@ def render_video(frames: np.ndarray, times: np.ndarray, out_dir: Path,
     cbar.set_label(f"{measure_name} voltage (uV)")
     title = ax.set_title("", fontsize=11)
 
+    out_path: Path = out_dir / "heatmap.mp4"
+
     frame_dir = None
     if video == "gif" or keep_frames:
         frame_dir = out_dir / FRAME_DIR
         frame_dir.mkdir(parents=True, exist_ok=True)
 
     proc = None
+    ffmpeg_stdin_pipe: "subprocess.Popen[bytes] | None" = None
     if video == "mp4":
         if not _have_ffmpeg():
             raise RuntimeError("ffmpeg not found on PATH; use --video gif")
@@ -208,6 +213,7 @@ def render_video(frames: np.ndarray, times: np.ndarray, out_dir: Path,
              "-i", "-", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
              "-crf", "18", "-preset", "medium", str(out_path)],
             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        ffmpeg_stdin_pipe = proc
 
     png_paths: List[Path] = []
     n = len(frames)
@@ -216,13 +222,14 @@ def render_video(frames: np.ndarray, times: np.ndarray, out_dir: Path,
         im.set_data(channel_grid(frames[f]))
         title.set_text(f"t = {times[f]:6.1f} s")
         fig.canvas.draw()
-        if video == "mp4":
-            buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
+        if ffmpeg_stdin_pipe is not None and ffmpeg_stdin_pipe.stdin is not None:
+            canvas = cast(FigureCanvasAgg, fig.canvas)
+            buf = np.asarray(canvas.buffer_rgba())[:, :, :3]
             if buf.shape[0] % 2:      # keep yuv420p happy (even dims)
                 buf = buf[:-1]
             if buf.shape[1] % 2:
                 buf = buf[:, :-1]
-            proc.stdin.write(buf.tobytes())
+            ffmpeg_stdin_pipe.stdin.write(buf.tobytes())
         if frame_dir is not None:
             png_path = frame_dir / f"frame_{f:06d}.png"
             fig.savefig(png_path)
@@ -240,7 +247,8 @@ def render_video(frames: np.ndarray, times: np.ndarray, out_dir: Path,
                     duration=int(1000.0 / fps), loop=0)
         del ims
     elif proc is not None:
-        proc.stdin.close()
+        assert proc.stdin is not None
+        proc.stdin.close()  # type: ignore[union-attr]
         proc.wait()
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg failed with code {proc.returncode}")
@@ -321,7 +329,7 @@ def main(args: argparse.Namespace) -> None:
     print(f"  time range:         {summary['t_start_s']:.1f} - "
           f"{summary['t_end_s']:.1f} s")
     print(f"  frames:             {summary['n_frames']:,}")
-    print(f"  video length:       {_fmt_duration(summary['video_length_s'])}")
+    print(f"  video length:       {_fmt_duration(cast(float, summary['video_length_s']))}")
     print(f"  color scale:        {summary['vmin_uv']:.1f} - "
           f"{summary['vmax_uv']:.1f} uV")
     print(f"  video:              {summary['video']}")

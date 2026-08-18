@@ -643,6 +643,7 @@ def load_waveforms(output_file: str) -> Dict[int, Dict[str, Any]]:
     has_multi_width = any(f"smooth_waveforms_{int(w)}ms" in archive.files
                           for w in smooth_windows_ms)
     has_legacy_smooth = "smooth_waveforms" in archive.files
+    legacy_width: float = float(SMOOTH_WINDOWS_MS[0])
     if has_legacy_smooth and not has_multi_width:
         legacy_width = float(archive["smooth_window_ms"]) \
             if "smooth_window_ms" in archive.files else float(SMOOTH_WINDOWS_MS[0])
@@ -777,7 +778,8 @@ def smooth_waveform(waveform: np.ndarray,
         window_len += 1
     if window_len < 3 or window_len >= len(waveform):
         return waveform
-    return scipy.signal.savgol_filter(waveform, window_len, polyorder)
+    return np.asarray(scipy.signal.savgol_filter(waveform, window_len, polyorder),
+                       dtype=float)
 
 
 def _tile_figure(waveform: np.ndarray, start_idx: int, peak_idx: int,
@@ -1178,7 +1180,7 @@ def gen_channel_interactive_html(results: Dict[int, Dict[str, Any]],
     print(f"  Saved interactive HTML to: {output_file}")
 
 
-def _resolve_run_paths(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path, Path]:
+def _resolve_run_paths(args: argparse.Namespace) -> Tuple[Path, Path, str, str, Path]:
     """Determine the run directory and all output paths.
 
     Normal run: creates a fresh timestamped run dir
@@ -1208,8 +1210,8 @@ def _resolve_run_paths(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path
         npz_path = run_dir / WAVEFORM_REL_PATH
 
     html_dir = run_dir / "html"
-    grid_path = args.spike_html or str(html_dir / "waveforms_grid.html")
-    channel_path = args.channel_html or str(html_dir / "all_ch_spikes.html")
+    grid_path: str = args.spike_html or str(html_dir / "waveforms_grid.html")
+    channel_path: str = args.channel_html or str(html_dir / "all_ch_spikes.html")
     return run_dir, npz_path, grid_path, channel_path, html_dir
 
 
@@ -1387,7 +1389,7 @@ def main(args: argparse.Namespace) -> None:
     print("=" * 60)
 
     if args.visualize_only:
-        results = load_waveforms(npz_path)
+        results = load_waveforms(str(npz_path))
         if not results:
             print("Error: No data loaded. Run without -v first.")
             return
@@ -1396,7 +1398,7 @@ def main(args: argparse.Namespace) -> None:
         results: Dict[int, Dict[str, Any]] = {}
         for channel in range(data.shape[1]):
             results[channel] = process_channel(data, channel)
-        save_waveforms(results, npz_path, source_file=args.data_file)
+        save_waveforms(results, str(npz_path), source_file=args.data_file)
         _write_run_meta(run_dir, args, results, npz_path)
 
     for channel in sorted(results.keys()):
@@ -1405,10 +1407,10 @@ def main(args: argparse.Namespace) -> None:
                 results, channel, args.data_file,
                 str(interactive_dir / INTERACTIVE_HTML_PATTERN.format(ch=channel)))
 
-    gen_spike_waveform_html(results, grid_path,
+    gen_spike_waveform_html(results, str(grid_path),
                             interactive_pattern=INTERACTIVE_HTML_PATTERN,
                             interactive_dir=INTERACTIVE_HTML_DIR)
-    gen_channel_html(results, channel_path, raw_file=args.data_file)
+    gen_channel_html(results, str(channel_path), raw_file=args.data_file)
 
     # Regenerate the static index.html next to this script (relative links
     # into outputs/, so it works when opened straight from disk).
