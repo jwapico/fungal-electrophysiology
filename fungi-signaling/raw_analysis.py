@@ -1,6 +1,11 @@
 """
 raw_analysis.py  (rev 5 - persisted raw + smoothed waveforms)
 
+Run from the project root:
+    python raw_analysis.py
+    python raw_analysis.py --data-file <path>
+    python raw_analysis.py -o outputs/<ts>/waveforms/waveforms.npz -v   (re-render without re-running all analyses)
+
 Pipeline for MEA compound-event waveform extraction (fungal spike recordings).
 
 Each channel k of the recording v_k (in microvolts) is segmented into
@@ -95,19 +100,65 @@ events (spikes are polyphasic) and one waveform window is extracted per event:
                                     - Applied once at extraction time; all variants are persisted alongside the raw window.
 
 Output layout: each run writes into its own timestamped directory
+    index.html                                                 (links to newest run, links all outputs from all runs)
     outputs/<YYYY-MM-DD_HH-MM-SS>/
         waveforms/waveforms.npz                                (persisted events: raw + smoothed windows)
         html/waveforms_grid.html                               (flex CSS grid of per-event tiles)
         html/all_ch_spikes.html                                (full per-channel traces with events)
         html/interactive_ch_views/channel_N_interactive.html   (click-to-zoom)
         run_meta.json                                          (parameters + per-channel summary)
-    index.html                                                 (links to newest run, links all outputs from all runs)
 
-Run from the project root:
-    python raw_analysis.py
-    python raw_analysis.py --data-file <path>
-    python raw_analysis.py -o outputs/<ts>/waveforms/waveforms.npz -v   # re-render without re-running all analyses
+waveforms.npz schema (np.savez_compressed):
+    Scalar metadata (saved as 0-d arrays or Python scalars):
+      sample_rate               int                   fs (Hz)
+      unit                      str                   "uV"
+      source_file               str                   path to the raw binary
+      min_window_ms             float                 MIN_WINDOW_MS
+      min_pad_s                 float                 MIN_PAD_S
+      pad_fraction              float                 PAD_FRACTION
+      extent_sigmas             float                 EXTENT_SIGMAS
+      event_gate_scale          float                 EVENT_GATE_SCALE
+      spike_gate_scale          float                 SPIKE_GATE_SCALE
+      smooth_method             str                   "savgol" or "none"
+      smooth_windows_ms         float64 (W,)          persisted smoothing widths in ms
+      smooth_polyorder          int                   Savitzky-Golay polynomial order
+      smooth_show_by_default    bool                  grid default variant
+
+    Per-channel scalar arrays (dtype=float64 or int64, shape=(N_ch,)):
+      thresholds                float64 (N_ch,)        spike gate per channel (S * sigma_k)
+      gates                     float64 (N_ch,)        envelope gate per channel (G * sigma_k)
+      stds                      float64 (N_ch,)        noise MAD per channel (sigma_k)
+      n_events                  int64   (N_ch,)        detected events before window extraction
+      n_extracted               int64   (N_ch,)        windows successfully extracted
+
+    Per-channel object arrays (dtype=object, shape=(N_ch,)).
+    Each element is a sub-array for one channel; event counts and window lengths vary per channel, so these are stored as object arrays:
+      channels                  int64   (N_ch,)         channel IDs, e.g. [0, 1, ..., 63]
+
+      waveforms                 object  (N_ch,)         waveforms[i] = object array of M_i raw windows, each float64 (W_i,)
+
+      smooth_waveforms_<w>ms    object  (N_ch,)         same but Savitzky-Golay smoothed at
+                                                        width w ms; one key per width in
+                                                        SMOOTH_WINDOWS_MS, e.g.
+                                                        smooth_waveforms_4ms
+
+      spike_times               object  (N_ch,)         spike_times[i] = float64 (M_i,)
+                                                        event times in seconds
+
+      window_sizes              object  (N_ch,)         window_sizes[i] = int (M_i,)
+                                                        window length in samples
+
+      peak_positions            object  (N_ch,)         peak_positions[i] = int (M_i,)
+                                                        offset of dominant peak within window
+                                                        (r_i = m_i - start_i)
+
+      window_starts             object  (N_ch,)         window_starts[i] = int (M_i,)
+                                                        absolute sample index of window start
+
+      amplitudes                object  (N_ch,)         amplitudes[i] = float64 (M_i,)
+                                                        signed dominant deflection v_k[m_i] (uV)
 """
+
 from __future__ import annotations
 
 import argparse
