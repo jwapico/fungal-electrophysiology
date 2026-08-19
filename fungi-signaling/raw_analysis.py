@@ -1,60 +1,112 @@
 """
 raw_analysis.py  (rev 5 - persisted raw + smoothed waveforms)
 
-Pipeline for MEA compound-event waveform extraction (fungal recordings).
+Pipeline for MEA compound-event waveform extraction (fungal spike recordings).
 
 Each channel k of the recording v_k (in microvolts) is segmented into
-multi-oscillation "events" and one waveform window is extracted per event:
+events (spikes are polyphasic) and one waveform window is extracted per event:
 
-  1. Robust noise floor:    sigma_k = 1.4826 * median |v_k - median(v_k)|
-     (MAD; 1.4826 = 1 / Phi^{-1}(3/4) so sigma_k = sigma for Gaussian noise).
-     The low envelope gate must not be inflated by the very events being
-     segmented, hence MAD (robust) rather than std (inflated by events).
-  2. Envelope gate:         b[n] = 1{|v_k[n]| >= G * sigma_k},  G = EVENT_GATE_SCALE.
-  3. Excursions:            maximal runs [s_j, e_j] with b == 1.
-  4. Gap merge:             runs with s_{j+1} - e_j - 1 <= tau_gap become ONE event
-                            (tau_gap = EVENT_GAP_MS = 5 ms) -> events [S_i, E_i].
-  5. Event gate:            keep i iff duration >= MIN_EVENT_MS  AND
-                            |v_k[m_i]| >= S * sigma_k  (S = SPIKE_GATE_SCALE),
-                            m_i = argmax_{[S_i,E_i]} |v_k|  (dominant deflection).
-  6. Oscillation count:     count_oscillations(v_k[S_i:E_i], sigma_k):
-                             #major alternating turning points (swing >=
-                             OSC_MIN_SWING_SIGMAS * sigma, spacing >=
-                             OSC_MIN_PERIOD_MS) -> ceil((K-1)/2) cycles.
-  7. Window:                W_i = (E_i-S_i+1) + 2*pad, with
-                             pad = max(PAD_FRACTION*(E_i-S_i+1), MIN_PAD_S*fs),
-                             i.e. symmetric padding proportional to the
-                             excursion length but never less than MIN_PAD_S on
-                             each side; clamped to MIN_WINDOW_MS but NOT to an
-                             upper bound (no max clipping). The window is
-                             aligned on the excursion (start at S_i - pre),
-                             with peak offset r_i = m_i - start_i.
-  8. Smoothing:             every raw window is smoothed with a zero-phase
-                            Savitzky-Golay filter (SMOOTH_METHOD, every width
-                            in SMOOTH_WINDOWS_MS, polyorder SMOOTH_POLYORDER)
-                            and ALL variants are PERSISTED ALONGSIDE the raw
-                            one. Downstream analysis (spike_sorting.py) and
-                            every visualization read the arrays from the npz;
-                            nothing is re-derived at render time.
+ - N    = total number of samples per channel
+ - v_k  = voltage trace for channel k, indexed by sample n = 0, ..., N-1
+ - fs   = sample rate in Hz (SAMPLE_RATE_HZ)
+ - k    = channel index,  k = 0, ..., 63
+
+  1. Robust noise floor:    To detect spiking events, we first calculate the noise floor using MAD (median absolute deviation):
+                                - sigma_k = 1.4826 * median_n |v_k[n] - median_m v_k[m]|
+                                  where n, m range over all N samples of channel k,
+                                  and 1.4826 = 1 / Phi^{-1}(3/4) so sigma_k is an
+                                  unbiased estimate of sigma for Gaussian noise.
+                                - The low envelope gate must not be inflated by the very events being
+                                  segmented, hence MAD (robust) rather than std (inflated by events).
+
+  2. Envelope gate:         Events are voltage fluctuations rising above 5 times the noise floor:
+                                - Binary mask b[n] = 1{ |v_k[n]| > G * sigma_k },  n = 0, ..., N-1
+                                  G = EVENT_GATE_SCALE = 5.0
+
+  3. Excursions:            Excursions are contiguous runs of samples above the envelope gate:
+                                - Excursion set E = { n : b[n] = 1 } is decomposed
+                                  into J contiguous runs [s_j, e_j], j = 0, ..., J-1 where:
+                                    - b[n] = 1 for all n in [s_j, e_j],
+                                     - the sample before the run is below the gate:
+                                       b[s_j - 1] = 0,  or  s_j = 0  (no sample at index -1;
+                                       this case only arises when b[0] = 1, i.e. the trace
+                                       itself starts above the gate),
+                                    - the sample after the run is below the gate:
+                                      b[e_j + 1] = 0,  or  e_j = N - 1  (run ends at trace end),
+                                    - runs are disjoint and ordered: e_j < s_{j+1}.
+
+  4. Gap merge:             Since spikes are polyphasic, a single spike may consist of multiple disjoint excursions - we must merge them:   
+                                - for consecutive runs j and j+1, define the inter-run gap
+                                  gap_j = s_{j+1} - e_j - 1   (count # of samples between consecutive excursions)
+                                  Merge j+1 into j iff  gap_j <= tau_gap,  where
+                                    - tau_gap = int(EVENT_GAP_MS * fs / 1000) samples,
+                                      EVENT_GAP_MS = 5.0 ms,  fs = SAMPLE_RATE_HZ.
+                                  Merging is greedy left-to-right; each merged run absorbs
+                                  subsequent runs while the gap condition holds, producing
+                                  M merged events [S_i, E_i],  i = 0,...,M-1.
+
+  5. Event gate:            Prune events that are too short or too weak:
+                                keep event i iff
+                                    D_i >= D_min   AND   |v_k[m_i]| >= S * sigma_k,
+                                where
+                                    D_i     = E_i - S_i + 1                        (duration in samples)
+                                    D_min   = int(MIN_EVENT_MS * fs / 1000)        (minimum duration in samples)
+                                    S       = SPIKE_GATE_SCALE = 5.0               (S and ^ determined through visual inspection/experimentation)
+                                    m_i     = argmax_{n in [S_i, E_i]} |v_k[n]|    (dominant deflection, sample index)
+
+  6. Window:                Expand excursion to capture rising/falling oscillations and add padding - extract a centered window showing all dynamics:
+                                Grow the excursion [S_i, E_i] into the extent [L_i, R_i] by expanding outward while
+                                    |v_k[n]| > e * sigma_k,  e = EXTENT_SIGMAS = 2.0:       (lower sigma for extent - weaker oscillations)
+                                    L_i = min{ n <= S_i : |v_k[n]| <= e*sigma_k } + 1,      (or 0 if none)
+                                    R_i = max{ n >= E_i : |v_k[n]| <= e*sigma_k } - 1.      (or N-1 if none)
+                                Then add padding scaled to window length, bounded by MIN_PAD_S:
+                                    L_ext = R_i - L_i + 1,
+                                    pad   = max( round(PAD_FRACTION * L_ext), round(MIN_PAD_S * fs) ),
+                                    W_i   = max( L_ext + 2*pad, w_min ),
+                                    where w_min = int(MIN_WINDOW_MS * fs / 1000).
+                                The window is centered on the dominant deflection m_i:
+                                    start_i = clamp( m_i - floor(W_i/2),  0,  N - W_i ),    (ensure windows cant extend past the trace boundaries)
+                                    r_i     = m_i - start_i                                 (peak offset, ~ W_i/2).
+                                The extracted waveform is x[n] = v_k[start_i + n],  n = 0, ..., W_i - 1.
+                                        - In summary, place a W_i-sample window symmetrically around
+                                          m_i so the peak is in the middle. If the window would extend
+                                          before the trace start (start_i < 0), pin start_i to 0; if it would
+                                          extend past the trace end (start_i > N - W_i), pin start_i to N - W_i.
+                                          The peak offset r_i = m_i - start_i tells you where the dominant
+                                          deflection lands inside the extracted window (~W_i/2 when centered,
+                                          shifts toward the edge when clamped at a trace boundary).
+                                            - Symmetric padding proportional to the extent length but never less than MIN_PAD_S on each side
+                                            - Clamped to MIN_WINDOW_MS but not to an upper bound
+
+   7. Smoothing:            Apply Savitzky-Golay smoothing to all windows - persisted alongsied the raw windows
+                                for each width w in SMOOTH_WINDOWS_MS = (1.0, 2.0, 4.0, 8.0) ms derive kernel length
+                                    L = round( w * fs / 1000 ),  forced odd  (L |= 1),
+                                    L = max( L, p + 1 ),  (L must be > p: a degree-p polynomial needs at least p + 1 data points to fit)
+                                where p = SMOOTH_POLYORDER = 4.
+                                The Savitzky-Golay smoothed signal is
+                                    y[n] = sum_{j = -L//2}^{L//2}  c_j * x[n + j],
+                                where c_j are the least-squares polynomial coefficients,
+                                depending on L and p only (precomputed by scipy.signal.savgol_filter)
+                                    - In summary: for each output sample y[n], take a symmetric window of 
+                                      L input samples centered at n, fit a degree-p polynomial to those
+                                      L points in a least-squares sense, and evaluate that polynomial at the center. 
+                                        - The c_j are the closed-form weights that implement this fit as a single convolution.
+                                      Because the window is symmetric, the fit does not shift peaks in time (zero-phase). 
+                                    - Applied once at extraction time; all variants are persisted alongside the raw window.
 
 Output layout: each run writes into its own timestamped directory
-   outputs/<YYYY-MM-DD_HH-MM-SS>/
-     waveforms/waveforms.npz        (persisted events: raw + smoothed windows)
-     html/waveforms_grid.html       (flex CSS grid of per-event tiles)
-     html/all_ch_spikes.html        (full per-channel traces with events)
-     html/interactive_ch_views/channel_N_interactive.html  (click-to-zoom)
-     run_meta.json                  (parameters + per-channel summary)
-
-Every run also regenerates the static entry point index.html next to this
-script (fungi-signaling/index.html), which links to the newest run's grid /
-all-channels / metadata pages and lists every older run. It is written by
-this script (write_output_index) with plain relative links, so it works when
-opened directly from disk (no server or JavaScript required).
+    outputs/<YYYY-MM-DD_HH-MM-SS>/
+        waveforms/waveforms.npz                                (persisted events: raw + smoothed windows)
+        html/waveforms_grid.html                               (flex CSS grid of per-event tiles)
+        html/all_ch_spikes.html                                (full per-channel traces with events)
+        html/interactive_ch_views/channel_N_interactive.html   (click-to-zoom)
+        run_meta.json                                          (parameters + per-channel summary)
+    index.html                                                 (links to newest run, links all outputs from all runs)
 
 Run from the project root:
     python raw_analysis.py
     python raw_analysis.py --data-file <path>
-    python raw_analysis.py -o outputs/<ts>/waveforms/waveforms.npz -v   # re-render
+    python raw_analysis.py -o outputs/<ts>/waveforms/waveforms.npz -v   # re-render without re-running all analyses
 """
 from __future__ import annotations
 
@@ -75,51 +127,31 @@ from matplotlib.figure import Figure
 import numpy as np
 import scipy.signal
 
+# ---------------- dataset constants ----------------
 SAMPLE_RATE_HZ: int = 30000
 NUM_CHANNELS: int = 64
 VOLTAGE_SCALE: float = 0.195
 BINARY_DTYPE: str = "int16"
-
 RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_control_0_cut800s.bin"
-
-# --------------------------------------------------------------------------
-# output layout (every run gets its own timestamped directory so iterations
-# can be tracked; -v re-renders a previous run's .npz in place)
-# --------------------------------------------------------------------------
-OUTPUT_ROOT: str = "outputs"
-TIMESTAMP_FORMAT: str = "%Y-%m-%d_%H-%M-%S"
-WAVEFORM_REL_PATH: str = "waveforms/waveforms.npz"
-SPIKE_HTML_REL_PATH: str = "html/waveforms_grid.html"
-CHANNEL_HTML_REL_PATH: str = "html/all_ch_spikes.html"
-INTERACTIVE_HTML_PATTERN: str = "channel_{ch}_interactive.html"
-INTERACTIVE_HTML_DIR: str = "interactive_ch_views"
-RUN_META_FILENAME: str = "run_meta.json"
-PLOTLY_JS: str = "cdn"
 
 # ---------------- event segmentation ----------------
 EVENT_GATE_SCALE: float = 5.0    # low envelope gate  (x noise)
 SPIKE_GATE_SCALE: float = 5.0    # high gate: an event's dominant peak must clear this
 EVENT_GAP_MS: float = 5.0        # merge excursions <= this apart into one event
 MIN_EVENT_MS: float = 0.5        # discard envelope blips shorter than this
-OSC_MIN_SWING_SIGMAS: float = 5.0  # oscillation swing must exceed this x noise (uV)
-OSC_MIN_PERIOD_MS: float = 1.0     # min spacing between counted turning points
 
 # ---------------- window extraction ----------------
 EXTENT_SIGMAS: float = 2.0   # window base = contiguous span where |v| > this x noise
 PAD_FRACTION: float = 0.25      # pre/post pad = this fraction of the extent length
-MIN_PAD_S: float = 0.02        # floor on the pre/post pad (seconds): the window
-                               # always extends at least this far each side, even
-                               # when the proportional pad would be smaller
+MIN_PAD_S: float = 0.02        # floor on the pre/post pad (seconds): the window always extends at least this far each side
 MIN_WINDOW_MS: float = 3.0
 
 # ---------------- visualization ----------------
 CHANNEL_DS_FACTOR: int = 10
-SPIKE_WINDOWS_LIMIT: int = 50  # default # of waveform tiles shown per channel in
-                               # the grid; a page toggle reveals all of them
+SPIKE_WINDOWS_LIMIT: int = 50  # default # of waveform tiles shown per channel in the grid; a page toggle reveals all of them
 FIGURE_DPI: int = 80
 TILE_DPI: int = 120          # dpi of the per-event grid tiles
 TRACE_DPI: int = 100
-
 INTERACTIVE_OVERVIEW_DS: int = 200
 INTERACTIVE_SPIKE_DS: int = 4
 SPIKE_CONTEXT_MS: float = 200.0
@@ -139,12 +171,65 @@ SMOOTH_WINDOWS_MS: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)  # savgol widths (ms
 SMOOTH_POLYORDER: int = 4                          # savgol polynomial order
 SMOOTH_SHOW_BY_DEFAULT: bool = False               # grid default: raw shown
 
+# --------------------------------------------------------------------------
+# output layout (every run gets its own timestamped directory so iterations
+# can be tracked; -v re-renders a previous run's .npz in place)
+# --------------------------------------------------------------------------
+OUTPUT_ROOT: str = "outputs"
+TIMESTAMP_FORMAT: str = "%Y-%m-%d_%H-%M-%S"
+WAVEFORM_REL_PATH: str = "waveforms/waveforms.npz"
+SPIKE_HTML_REL_PATH: str = "html/waveforms_grid.html"
+CHANNEL_HTML_REL_PATH: str = "html/all_ch_spikes.html"
+INTERACTIVE_HTML_PATTERN: str = "channel_{ch}_interactive.html"
+INTERACTIVE_HTML_DIR: str = "interactive_ch_views"
+RUN_META_FILENAME: str = "run_meta.json"
+PLOTLY_JS: str = "cdn"
 
 class Event(NamedTuple):
     onset: int
     offset: int
-    main: int            # dominant (largest |deflection|) sample
-    n_oscillations: int
+    center: int
+
+
+def main(args: argparse.Namespace) -> None:
+    run_dir, npz_path, grid_path, channel_path, html_dir = _resolve_run_paths(args)
+    interactive_dir = html_dir / INTERACTIVE_HTML_DIR
+
+    print("=" * 60)
+    print("MEA Spike Waveform Pipeline (event-based)")
+    print("=" * 60)
+    print(f"Data file:  {args.data_file}")
+    print(f"Run dir:    {run_dir}")
+    print(f"Waveforms:  {npz_path}")
+    print("=" * 60)
+
+    if args.visualize_only:
+        results = load_waveforms(str(npz_path))
+        if not results:
+            print("Error: No data loaded. Run without -v first.")
+            return
+    else:
+        data = load_raw_data(args.data_file)
+        results: Dict[int, Dict[str, Any]] = {}
+        for channel in range(data.shape[1]):
+            results[channel] = process_channel(data, channel)
+        save_waveforms(results, str(npz_path), source_file=args.data_file)
+        _write_run_meta(run_dir, args, results, npz_path)
+
+    for channel in sorted(results.keys()):
+        if results[channel]["n_extracted"] > 0:
+            gen_channel_interactive_html(
+                results, channel, args.data_file,
+                str(interactive_dir / INTERACTIVE_HTML_PATTERN.format(ch=channel)))
+
+    gen_spike_waveform_html(results, str(grid_path), interactive_pattern=INTERACTIVE_HTML_PATTERN, interactive_dir=INTERACTIVE_HTML_DIR)
+    gen_channel_html(results, str(channel_path), raw_file=args.data_file)
+    write_output_index(Path(os.path.dirname(os.path.abspath(__file__))), Path(args.out_root))
+
+    print("\n" + "=" * 60)
+    print("DONE!")
+    print(f"Open {grid_path} in your browser")
+    print("=" * 60)
 
 
 def load_raw_data(filepath: str) -> np.ndarray:
@@ -182,95 +267,6 @@ def estimate_noise_mad(samples: np.ndarray) -> float:
     return float(1.4826 * np.median(np.abs(samples - median)))
 
 
-def count_oscillations(
-    excursion: np.ndarray,
-    noise: float,
-    swing_sigmas: float = OSC_MIN_SWING_SIGMAS,
-    min_period_ms: float = OSC_MIN_PERIOD_MS,
-    sample_rate: int = SAMPLE_RATE_HZ,
-) -> int:
-    """Count the major oscillations inside one event's excursion segment.
-
-    Formal description
-    ------------------
-    Let {e_k} be the local extrema (peaks and troughs) of the segment in time
-    order, and s_k = |x[e_{k+1}] - x[e_k]| the swing between consecutive
-    extrema. A turning point is *significant* when
-
-        (i) it alternates sign with the previous significant one, and
-        (ii) its swing to that neighbour exceeds s_min = c * sigma, where
-             sigma is the channel's robust noise scale (OSC_MIN_SWING_SIGMAS
-             x sigma) and
-        (iii) it is spaced >= OSC_MIN_PERIOD_MS from the previous one.
-
-    Keeping K significant turning points, the oscillation count is
-
-        N = max(1, ceil((K - 1) / 2)),
-
-    i.e. the number of full (plus any trailing half) cycles spanned by the
-    significant turning points. Notes:
-
-      * The swing threshold is *absolute in noise units*, not a fraction of
-        the largest swing, so a single dominant deflection cannot dwarf the
-        other oscillations (the failure mode of a max-relative threshold).
-      * Requiring sign alternation prevents counting ripple that sits on a
-        plateau (e.g. tiny bumps inside a long negative dip).
-      * Counting runs over the *excursion* [onset, offset], NOT the padded
-        window, so pre/post-event baseline micro-activity is not counted.
-    """
-    samples = np.asarray(excursion, dtype=float)
-    if len(samples) < 3:
-        return 1
-
-    # All local maxima and minima, each tagged with its polarity (+1/-1).
-    peaks = scipy.signal.find_peaks(samples)[0]
-    troughs = scipy.signal.find_peaks(-samples)[0]
-    extrema = sorted([(int(i), 1) for i in peaks] + [(int(i), -1) for i in troughs])
-    if not extrema:
-        return 1
-    extremum_indices = np.array([e[0] for e in extrema], dtype=float)
-    extremum_polarities = np.array([e[1] for e in extrema])
-    extremum_values = np.array([samples[e[0]] for e in extrema], dtype=float)
-    min_swing = swing_sigmas * noise
-    min_period_samples = min_period_ms * sample_rate / 1000.0
-
-    # pass A: sign alternation + absolute swing threshold. The threshold is
-    # in noise units (not a fraction of the largest swing), so a single
-    # dominant deflection cannot dwarf the other oscillations.
-    pass_a_indices = []
-    for candidate_idx in range(len(extrema)):
-        if not pass_a_indices:
-            pass_a_indices.append(candidate_idx)
-            continue
-        last_kept_idx = pass_a_indices[-1]
-        if extremum_polarities[last_kept_idx] == extremum_polarities[candidate_idx]:
-            continue  # same sign: ripple on a plateau, not an oscillation
-        if abs(extremum_values[candidate_idx] - extremum_values[last_kept_idx]) \
-                < min_swing:
-            continue
-        pass_a_indices.append(candidate_idx)
-
-    # pass B: minimum spacing between turning points; when two are too close,
-    # keep the one with the larger swing and drop the other.
-    kept_indices = []
-    for candidate_idx in pass_a_indices:
-        if kept_indices and (extremum_indices[candidate_idx]
-                             - extremum_indices[kept_indices[-1]]) < min_period_samples:
-            previous_swing = (abs(extremum_values[kept_indices[-1]]
-                                  - extremum_values[kept_indices[-2]])
-                              if len(kept_indices) >= 2 else 1e18)
-            current_swing = abs(extremum_values[candidate_idx]
-                                - extremum_values[kept_indices[-1]])
-            if current_swing > previous_swing:
-                kept_indices.pop()  # the candidate is stronger: replace
-            else:
-                continue  # the earlier extremum wins
-        kept_indices.append(candidate_idx)
-
-    # K significant turning points span K-1 swings => K-1 half cycles.
-    return max(1, int(np.ceil((len(kept_indices) - 1) / 2)))
-
-
 def detect_events(
     voltage: np.ndarray,
     noise_estimator: Callable[[np.ndarray], float] = estimate_noise_mad,
@@ -278,29 +274,23 @@ def detect_events(
     spike_gate_scale: float = SPIKE_GATE_SCALE,
     gap_ms: float = EVENT_GAP_MS,
     min_event_ms: float = MIN_EVENT_MS,
-    swing_sigmas: float = OSC_MIN_SWING_SIGMAS,
-    min_period_ms: float = OSC_MIN_PERIOD_MS,
     sample_rate: int = SAMPLE_RATE_HZ,
 ) -> Tuple[List[Event], float, float, float]:
-    """Segment the trace v into multi-oscillation events.
+    """Segment the trace v into events.
 
     Formal description
     ------------------
     Let sigma = noise_estimator(v), gate = G*sigma, spike_gate = S*sigma.
 
-    1. Excursion set:  E = { n : |v[n]| >= gate }.
+    1. Excursion set:  E = { n : |v[n]| > gate }.
     2. Runs: maximal contiguous intervals [s_j, e_j] within E.
     3. Merge: run j+1 is joined to run j iff
            s_{j+1} - e_j - 1 <= gap_samples,   gap_samples = tau_gap * fs/1000
        producing events [S_i, E_i].
     4. Event gate: keep i iff
            (E_i - S_i + 1) >= min_event_samples  AND
-           |v[m_i]| >= spike_gate,   m_i = argmax_{n in [S_i,E_i]} |v[n]|.
+           |v[m_i]| >= spike_gate,   m_i = argmax_{n in [S_i, E_i]} |v[n]|.
        m_i is the "dominant deflection" (largest |voltage| in the event).
-    5. Oscillation count:  N_i = count_oscillations(v[S_i:E_i], sigma), the
-       number of major alternating turning points (swing >= OSC_MIN_SWING_SIGMAS
-       x sigma, spacing >= OSC_MIN_PERIOD_MS) halved into full cycles
-       (see count_oscillations for the formal definition).
 
     Returns:
         (events, noise, gate, spike_gate)
@@ -338,10 +328,8 @@ def detect_events(
         dominant_sample = run_start + dominant_idx_in_excursion
         if abs(voltage[dominant_sample]) < spike_gate:
             continue  # no deflection strong enough to be a real spike
-        n_oscillations = count_oscillations(excursion, noise)
         events.append(Event(onset=run_start, offset=run_end,
-                            main=dominant_sample,
-                            n_oscillations=n_oscillations))
+                            center=dominant_sample))
 
     return events, noise, gate, spike_gate
 
@@ -422,13 +410,13 @@ def extract_event_window(
         return None
     # Center the window on the dominant deflection so every event's peak lands
     # at the same relative position (required for family sorting).
-    start = event.main - window_len // 2
+    start = event.center - window_len // 2
     start = int(max(0, min(start, len(voltage) - window_len)))
     end = start + window_len
 
     waveform = voltage[start:end].copy()
-    return (waveform, event.main / sample_rate, window_len, start,
-            event.main - start)
+    return (waveform, event.center / sample_rate, window_len, start,
+            event.center - start)
 
 
 def process_channel(data: np.ndarray, channel: int) -> Dict[str, Any]:
@@ -448,7 +436,6 @@ def process_channel(data: np.ndarray, channel: int) -> Dict[str, Any]:
       * window_sizes      - W_i (samples)
       * peak_indices      - r_i = m_i - start_i (dominant-peak offset)
       * window_starts     - start_i (absolute sample index)
-      * n_oscillations    - count_oscillations() result (major cycles)
       * amplitudes        - signed dominant deflection v_k[m_i]  (uV)
     """
     print(f"\nProcessing channel {channel}...")
@@ -464,7 +451,6 @@ def process_channel(data: np.ndarray, channel: int) -> Dict[str, Any]:
     window_sizes: List[int] = []
     window_starts: List[int] = []
     peak_positions: List[int] = []
-    n_oscillations: List[int] = []
     amplitudes: List[float] = []
 
     for event in events:
@@ -483,8 +469,7 @@ def process_channel(data: np.ndarray, channel: int) -> Dict[str, Any]:
         window_sizes.append(window_size)
         window_starts.append(start_idx)
         peak_positions.append(peak_idx)
-        n_oscillations.append(event.n_oscillations)
-        amplitudes.append(float(voltage[event.main]))
+        amplitudes.append(float(voltage[event.center]))
 
     n_extracted = len(waveforms)
     print(f"  Extracted {n_extracted} waveforms")
@@ -496,7 +481,6 @@ def process_channel(data: np.ndarray, channel: int) -> Dict[str, Any]:
         "window_sizes": np.array(window_sizes, dtype=int),
         "peak_indices": np.array(peak_positions, dtype=int),
         "window_starts": np.array(window_starts, dtype=int),
-        "n_oscillations": np.array(n_oscillations, dtype=int),
         "amplitudes": np.array(amplitudes, dtype=float),
         "threshold": spike_gate,
         "gate": gate,
@@ -541,7 +525,6 @@ def save_waveforms(results: Dict[int, Dict[str, Any]],
     window_sizes = np.empty(n_ch, dtype=object)
     peak_positions = np.empty(n_ch, dtype=object)
     window_starts = np.empty(n_ch, dtype=object)
-    oscillation_counts = np.empty(n_ch, dtype=object)
     amplitudes = np.empty(n_ch, dtype=object)
     thresholds = np.zeros(n_ch)
     gates = np.zeros(n_ch)
@@ -559,8 +542,6 @@ def save_waveforms(results: Dict[int, Dict[str, Any]],
         window_sizes[channel_idx] = np.asarray(channel_data["window_sizes"], dtype=int)
         peak_positions[channel_idx] = np.asarray(channel_data["peak_indices"], dtype=int)
         window_starts[channel_idx] = np.asarray(channel_data["window_starts"], dtype=int)
-        oscillation_counts[channel_idx] = np.asarray(
-            channel_data["n_oscillations"], dtype=int)
         amplitudes[channel_idx] = np.asarray(channel_data["amplitudes"], dtype=float)
         thresholds[channel_idx] = channel_data["threshold"]
         gates[channel_idx] = channel_data["gate"]
@@ -575,7 +556,6 @@ def save_waveforms(results: Dict[int, Dict[str, Any]],
         "window_sizes": window_sizes,
         "peak_positions": peak_positions,
         "window_starts": window_starts,
-        "n_oscillations": oscillation_counts,
         "amplitudes": amplitudes,
         "thresholds": thresholds,
         "gates": gates,
@@ -609,7 +589,7 @@ def load_waveforms(output_file: str) -> Dict[int, Dict[str, Any]]:
     Repopulates each channel's "waveforms", "smooth_waveforms" (a dict
     mapping each persisted smoothing width in ms -> list of smoothed arrays),
     "spike_times", "window_sizes", "peak_indices", "window_starts",
-    "n_oscillations", "amplitudes", "threshold", "gate", "std_dev",
+    "amplitudes", "threshold", "gate", "std_dev",
     "n_events", "n_extracted" and the smoothing parameters recorded in the
     archive, so a previous run can be re-rendered (-v) without re-reading the
     raw binary and without re-deriving any waveform.
@@ -676,8 +656,6 @@ def load_waveforms(output_file: str) -> Dict[int, Dict[str, Any]]:
                                        dtype=int),
             "window_starts": np.asarray(archive["window_starts"][channel_idx],
                                         dtype=int),
-            "n_oscillations": np.asarray(archive["n_oscillations"][channel_idx],
-                                         dtype=int),
             "amplitudes": np.asarray(archive["amplitudes"][channel_idx], dtype=float),
             "threshold": float(archive["thresholds"][channel_idx]),
             "gate": float(archive["gates"][channel_idx]),
@@ -783,7 +761,7 @@ def smooth_waveform(waveform: np.ndarray,
 
 
 def _tile_figure(waveform: np.ndarray, start_idx: int, peak_idx: int,
-                 n_osc: int, sample_rate: int = SAMPLE_RATE_HZ,
+                 sample_rate: int = SAMPLE_RATE_HZ,
                  ylim: Optional[Tuple[float, float]] = None) -> Figure:
     """Build one small tile figure for a single event window.
 
@@ -793,8 +771,6 @@ def _tile_figure(waveform: np.ndarray, start_idx: int, peak_idx: int,
       * y-axis = window voltage (uV), with ticks drawn at the window's min
         and max values (dashed horizontal lines) so peak-to-peak is read
         directly off the tile.
-      * "N osc" label in the top-right corner of the axes: the computed
-        oscillation count for manual verification.
     """
     fig, ax = plt.subplots(figsize=(1.7, 1.15))
     time_axis = (start_idx + np.arange(len(waveform))) / sample_rate
@@ -811,8 +787,6 @@ def _tile_figure(waveform: np.ndarray, start_idx: int, peak_idx: int,
     ax.tick_params(labelsize=5, length=2)
     ax.set_xticks([time_axis[0], time_axis[-1]])
     ax.set_xticklabels([f"{time_axis[0]:.4f}", f"{time_axis[-1]:.4f}"], fontsize=5)
-    ax.text(0.985, 0.985, f"{n_osc} osc", transform=ax.transAxes,
-            ha="right", va="top", fontsize=6, color="#555")
     fig.tight_layout(pad=0.15)
     return fig
 
@@ -903,8 +877,7 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
     html_parts.append("    <p>Every extracted event window, per channel. "
                       "x-axis is absolute recording time (s); the red dotted "
                       "lines mark the window min/max voltage; the dashed line "
-                      "is the dominant peak; the corner number is the computed "
-                      "oscillation count. Click a tile to open the channel's "
+                      "is the dominant peak. Click a tile to open the channel's "
                       "interactive view zoomed to that event. All traces are "
                       "the exact persisted waveforms from the npz (raw and "
                       "every Savitzky-Golay width are computed once at "
@@ -919,7 +892,6 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
         spike_times = channel_data["spike_times"]
         peak_indices = channel_data["peak_indices"]
         window_starts = channel_data["window_starts"]
-        oscillation_counts = channel_data["n_oscillations"]
         env_gate = EVENT_GATE_SCALE * channel_data["std_dev"]
         spk_gate = SPIKE_GATE_SCALE * channel_data["std_dev"]
 
@@ -928,24 +900,22 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
             ylim = (float(raw_waveform.min()), float(raw_waveform.max()))
             tile_prefix = f"ch{channel:02d}_e{index:04d}"
             fig = _tile_figure(raw_waveform, int(window_starts[index]),
-                               int(peak_indices[index]),
-                               int(oscillation_counts[index]), ylim=ylim)
+                               int(peak_indices[index]), ylim=ylim)
             _save_figure_png(fig, tiles_dir / f"{tile_prefix}_raw.png",
                              dpi=dpi, tight=False)
             # Smoothed tiles render the SAVED smoothed arrays, not fresh
             # smooth_waveform() calls: the archive is the single source of truth.
-            img_entries = [f'          <img class="raw" src="tiles/{tile_prefix}_raw.png" '
+            img_entries = [f'          <img class="raw" loading="lazy" src="tiles/{tile_prefix}_raw.png" '
                            f'alt="ch{channel} t={float(spike_times[index]):.4f}s (raw)">']
             for window_ms in smooth_windows_ms:
                 tag = f"{int(window_ms)}ms"
                 smooth_variant = smooth_waveforms[window_ms][index]
                 fig = _tile_figure(smooth_variant, int(window_starts[index]),
-                                   int(peak_indices[index]),
-                                   int(oscillation_counts[index]), ylim=ylim)
+                                   int(peak_indices[index]), ylim=ylim)
                 _save_figure_png(fig, tiles_dir / f"{tile_prefix}_{tag}.png",
                                  dpi=dpi, tight=False)
                 img_entries.append(
-                    f'          <img class="s{tag}" src="tiles/{tile_prefix}_{tag}.png" '
+                    f'          <img class="s{tag}" loading="lazy" src="tiles/{tile_prefix}_{tag}.png" '
                     f'alt="ch{channel} t={float(spike_times[index]):.4f}s ({tag})">')
             event_time = float(spike_times[index])
             margin = (len(raw_waveform) / (2.0 * SAMPLE_RATE_HZ)
@@ -956,8 +926,7 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
                     f"?t0={t0:.4f}&t1={t1:.4f}")
             tiles.append(
                 f'        <a class="tile" href="{href}" target="_blank" '
-                f'title="ch{channel} event t={event_time:.4f}s, '
-                f'{int(oscillation_counts[index])} osc">\n'
+                f'title="ch{channel} event t={event_time:.4f}s">\n'
                 + "\n".join(img_entries) + "\n"
                 f'        </a>')
 
@@ -968,8 +937,7 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
                 <div class="stats">
                     <label><input type="checkbox" class="ch-limit" checked
                         onchange="this.closest('.channel-section').classList.toggle('show-all', !this.checked)">
-                        Limit to first <strong>{spike_windows_limit}</strong> windows
-                        (uncheck to show all {len(tiles)})</label>
+                        Limit to first <strong>{spike_windows_limit}</strong> windows</label>
                 </div>"""
 
         html_parts.append(f"""
@@ -1016,8 +984,8 @@ def gen_channel_html(results: Dict[int, Dict[str, Any]],
         channel_data = results[channel]
         voltage = raw_data[:, channel] * VOLTAGE_SCALE
         downsampled_voltage = voltage[::ds_factor] if ds_factor > 0 else voltage
-        downsampled_time = (np.arange(len(downsampled_voltage)) /
-                            (SAMPLE_RATE_HZ / ds_factor) if ds_factor > 0
+        downsampled_time = (np.arange(len(downsampled_voltage)) / (SAMPLE_RATE_HZ / ds_factor)
+                            if ds_factor > 0
                             else np.arange(len(downsampled_voltage)) / SAMPLE_RATE_HZ)
 
         # Dominant-peak positions: start of the extracted window + offset of
@@ -1243,8 +1211,6 @@ def _write_run_meta(run_dir: Path, args: argparse.Namespace,
             "spike_gate_scale": SPIKE_GATE_SCALE,
             "event_gap_ms": EVENT_GAP_MS,
             "min_event_ms": MIN_EVENT_MS,
-            "osc_min_swing_sigmas": OSC_MIN_SWING_SIGMAS,
-            "osc_min_period_ms": OSC_MIN_PERIOD_MS,
             "pad_fraction": PAD_FRACTION,
             "min_pad_s": MIN_PAD_S,
             "min_window_ms": MIN_WINDOW_MS,
@@ -1374,52 +1340,6 @@ def write_output_index(output_path: Path, output_root: Path) -> None:
 """
     (output_path / "index.html").write_text(html)
     print(f"Updated output index: {output_path / 'index.html'}")
-
-
-def main(args: argparse.Namespace) -> None:
-    run_dir, npz_path, grid_path, channel_path, html_dir = _resolve_run_paths(args)
-    interactive_dir = html_dir / INTERACTIVE_HTML_DIR
-
-    print("=" * 60)
-    print("MEA Spike Waveform Pipeline (event-based)")
-    print("=" * 60)
-    print(f"Data file:  {args.data_file}")
-    print(f"Run dir:    {run_dir}")
-    print(f"Waveforms:  {npz_path}")
-    print("=" * 60)
-
-    if args.visualize_only:
-        results = load_waveforms(str(npz_path))
-        if not results:
-            print("Error: No data loaded. Run without -v first.")
-            return
-    else:
-        data = load_raw_data(args.data_file)
-        results: Dict[int, Dict[str, Any]] = {}
-        for channel in range(data.shape[1]):
-            results[channel] = process_channel(data, channel)
-        save_waveforms(results, str(npz_path), source_file=args.data_file)
-        _write_run_meta(run_dir, args, results, npz_path)
-
-    for channel in sorted(results.keys()):
-        if results[channel]["n_extracted"] > 0:
-            gen_channel_interactive_html(
-                results, channel, args.data_file,
-                str(interactive_dir / INTERACTIVE_HTML_PATTERN.format(ch=channel)))
-
-    gen_spike_waveform_html(results, str(grid_path),
-                            interactive_pattern=INTERACTIVE_HTML_PATTERN,
-                            interactive_dir=INTERACTIVE_HTML_DIR)
-    gen_channel_html(results, str(channel_path), raw_file=args.data_file)
-
-    # Regenerate the static index.html next to this script (relative links
-    # into outputs/, so it works when opened straight from disk).
-    write_output_index(Path(os.path.dirname(os.path.abspath(__file__))), Path(args.out_root))
-
-    print("\n" + "=" * 60)
-    print("DONE!")
-    print(f"Open {grid_path} in your browser")
-    print("=" * 60)
 
 
 if __name__ == "__main__":

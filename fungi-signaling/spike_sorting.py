@@ -556,9 +556,6 @@ def run_sorting(npz_path: str, method: str, L: int = DEFAULT_L,
             m = labels == j
             fam_desc.append({
                 "n_members": int(m.sum()),
-                "n_osc_median": float(np.median(d["n_oscillations"][m])),
-                "n_osc_range": [int(d["n_oscillations"][m].min()),
-                                int(d["n_oscillations"][m].max())],
                 "amp_median_uV": float(np.median(np.abs(d["amplitudes"][m]))),
                 "amp_iqr_uV": float(np.percentile(np.abs(d["amplitudes"][m]), 75)
                                     - np.percentile(np.abs(d["amplitudes"][m]), 25)),
@@ -679,7 +676,7 @@ def gen_gallery_html(run: Dict[str, Any], out_path: Path) -> None:
     for cid, nodes in enumerate(run["components"]):
         gsum = run["global_summary"][cid]
         # assemble member (time, channel) pairs
-        ts, chs, oscs = [], [], []
+        ts, chs = [], []
         for i in nodes:
             f = run["families"][i]
             d = results[f["ch"]]
@@ -687,7 +684,6 @@ def gen_gallery_html(run: Dict[str, Any], out_path: Path) -> None:
             m = lbl == f["family"]
             ts.extend(d["spike_times"][m].tolist())
             chs.extend([f["ch"]] * int(m.sum()))
-            oscs.extend(d["n_oscillations"][m].tolist())
             color = None
         ts = np.asarray(ts)
 
