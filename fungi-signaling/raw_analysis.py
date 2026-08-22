@@ -180,29 +180,32 @@ from visualization_tools import (
 )
 
 # ---------------- dataset constants ----------------
+RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_control_0_cut800s.bin"     # https://zenodo.org/records/17588964
+#   - Extracellular electrophysiological effects on MEA recordings of living mycelium following in-vivo polydopamine polymerisation - Adamatzky
+RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_0_mycelium.bin"            # https://zenodo.org/records/17633358
+#   - Millisecond spikes in MEA recording of dispersed mycelium absent in dehydration and fungicidal assays - Adamatzky
 SAMPLE_RATE_HZ: int = 30000
 NUM_CHANNELS: int = 64
 VOLTAGE_SCALE: float = 0.195
 BINARY_DTYPE: str = "int16"
-RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_control_0_cut800s.bin"
 
 # ---------------- event segmentation ----------------
-EVENT_GATE_SCALE: float = 5.0    # low envelope gate  (x noise)
-SPIKE_GATE_SCALE: float = 5.0    # high gate: an event's dominant peak must clear this
-EVENT_GAP_MS: float = 5.0        # merge excursions <= this apart into one event
-MIN_EVENT_MS: float = 0.5        # discard envelope blips shorter than this
+EVENT_GATE_SCALE: float = 5.0                   # low envelope gate  (x noise)
+SPIKE_GATE_SCALE: float = 5.0                   # high gate: an event's dominant peak must clear this
+EVENT_GAP_MS: float = 5.0                       # merge excursions <= this apart into one event
+MIN_EVENT_MS: float = 0.5                       # discard envelope blips shorter than this
 
 # ---------------- window extraction ----------------
-EXTENT_SIGMAS: float = 2.0   # window base = contiguous span where |v| > this x noise
-PAD_FRACTION: float = 0.25      # pre/post pad = this fraction of the extent length
-MIN_PAD_S: float = 0.02        # floor on the pre/post pad (seconds): the window always extends at least this far each side
-MIN_WINDOW_MS: float = 3.0
+EXTENT_SIGMAS: float = 2.0                      # window base = contiguous span where |v| > this x noise
+PAD_FRACTION: float = 0.25                      # pre/post pad = this fraction of the extent length
+MIN_PAD_S: float = 0.02                         # floor on the pre/post pad (seconds): the window always extends at least this far each side
+MIN_WINDOW_MS: float = 3.0                      # floor on the total window length (ms): the window always extends at least this far total
 
 # --------- persisted waveform smoothing ------------
-SMOOTH_METHOD: str = "savgol"                      # "savgol" | "none"
-SMOOTH_WINDOWS_MS: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)  # savgol widths (ms)
-SMOOTH_POLYORDER: int = 4                          # savgol polynomial order
-SMOOTH_SHOW_BY_DEFAULT: bool = False               # grid default: raw shown
+SMOOTH_METHOD: str = "savgol"                                   # "savgol" | "none"
+SMOOTH_WINDOWS_MS: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)     # savgol widths (ms)
+SMOOTH_POLYORDER: int = 4                                       # savgol polynomial order
+SMOOTH_SHOW_BY_DEFAULT: bool = False                            # grid default: raw shown
 
 # ------------------ output paths -------------------
 OUTPUT_ROOT: str = "outputs"
@@ -232,6 +235,7 @@ def main(args: argparse.Namespace) -> None:
     print("=" * 60)
 
     raw_data = load_raw_data(args.data_file)
+
     if args.visualize_only:
         results = load_waveforms(str(npz_path))
         if not results:
@@ -242,8 +246,8 @@ def main(args: argparse.Namespace) -> None:
         for channel in range(raw_data.shape[1]):
             results[channel] = process_channel(raw_data, channel)
 
-        save_waveforms(results, str(npz_path), source_file=args.data_file)
-        _write_run_meta(run_dir, args, results, npz_path)
+    save_waveforms(results, str(npz_path), source_file=args.data_file)
+    _write_run_meta(run_dir, args, results, npz_path)
 
     for channel in sorted(results.keys()):
         if results[channel]["n_extracted"] > 0:
@@ -276,23 +280,32 @@ def main(args: argparse.Namespace) -> None:
                      spike_gate_scale=SPIKE_GATE_SCALE
     )
     
-    write_output_index(Path(os.path.dirname(os.path.abspath(__file__))), Path(args.out_root), TIMESTAMP_FORMAT, RUN_META_FILENAME)
+    index_filepath = write_output_index(Path(os.path.dirname(os.path.abspath(__file__))), Path(args.out_root), TIMESTAMP_FORMAT, RUN_META_FILENAME)
 
     print("\n" + "=" * 60)
     print("DONE!")
-    print(f"Open {grid_path} in your browser")
+    print(f"Open {index_filepath} in your browser")
     print("=" * 60)
 
 
 def load_raw_data(filepath: str) -> np.ndarray:
-    """Load interleaved int16 MEA binary as a memmap of shape (T, 64).
+    """Load an interleaved int16 MEA binary as a 2-D array (T, 64).
 
-    The raw file stores sample y[n] for the interleaved stream; the channel
-    index is k = n mod 64, the time index is t = n // 64. Reshaping the flat
-    array into (-1, NUM_CHANNELS) de-interleaves it in one step:
-        Y[t, k] = y[64*t + k],   t = 0..T-1,  k = 0..63.
-    Memory-mapped (no full load) so that 3.4 GB of data 
-    (900 s * 30 kHz * 64 * 2 bytes) streams through without exhausting RAM.
+    Memory-maps the file (no full load) and reshapes the flat interleaved
+    stream into one row per time step, one column per channel. The 3.4 GB
+    file (900 s * 30 kHz * 64 ch * 2 bytes) streams through without
+    exhausting RAM.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to the raw binary file containing interleaved int16 samples.
+
+    Returns
+    -------
+    np.ndarray
+        int16 array of shape (T, 64) where T is the number of time steps.
+        Y[t, k] is the raw sample for channel k at time step t.
     """
     print(f"Loading raw data from: {filepath}")
     raw = np.memmap(filepath, dtype=BINARY_DTYPE, mode="r")
@@ -306,187 +319,28 @@ def load_raw_data(filepath: str) -> np.ndarray:
     return recording
 
 
-def estimate_noise_mad(samples: np.ndarray) -> float:
-    """Robust noise scale (median absolute deviation).
-
-        sigma_hat = 1.4826 * median_n |x_n - median_m x_m|
-
-    The constant 1.4826 = 1 / Phi^{-1}(3/4) makes sigma_hat an unbiased
-    estimate of the Gaussian standard deviation sigma, while remaining
-    insensitive to the (rare, large) events that would inflate the std.
-    """
-    median = float(np.median(samples))
-    return float(1.4826 * np.median(np.abs(samples - median)))
-
-
-def detect_events(
-    voltage: np.ndarray,
-    noise_estimator: Callable[[np.ndarray], float] = estimate_noise_mad,
-    gate_scale: float = EVENT_GATE_SCALE,
-    spike_gate_scale: float = SPIKE_GATE_SCALE,
-    gap_ms: float = EVENT_GAP_MS,
-    min_event_ms: float = MIN_EVENT_MS,
-    sample_rate: int = SAMPLE_RATE_HZ,
-) -> Tuple[List[Event], float, float, float]:
-    """Segment the trace v into events.
-
-    Formal description
-    ------------------
-    Let sigma = noise_estimator(v), gate = G*sigma, spike_gate = S*sigma.
-
-    1. Excursion set:  E = { n : |v[n]| > gate }.
-    2. Runs: maximal contiguous intervals [s_j, e_j] within E.
-    3. Merge: run j+1 is joined to run j iff
-           s_{j+1} - e_j - 1 <= gap_samples,   gap_samples = tau_gap * fs/1000
-       producing events [S_i, E_i].
-    4. Event gate: keep i iff
-           (E_i - S_i + 1) >= min_event_samples  AND
-           |v[m_i]| >= spike_gate,   m_i = argmax_{n in [S_i, E_i]} |v[n]|.
-       m_i is the "dominant deflection" (largest |voltage| in the event).
-
-    Returns:
-        (events, noise, gate, spike_gate)
-    """
-    noise = float(noise_estimator(voltage))
-    gate = gate_scale * noise
-    spike_gate = spike_gate_scale * noise
-
-    # Samples whose |amplitude| clears the low envelope gate.
-    above_gate_indices = np.flatnonzero(np.abs(voltage) > gate)
-    if len(above_gate_indices) == 0:
-        return [], noise, gate, spike_gate
-
-    # Maximal contiguous runs within the excursion set.
-    run_breaks = np.flatnonzero(np.diff(above_gate_indices) > 1)
-    run_starts = np.r_[above_gate_indices[0], above_gate_indices[run_breaks + 1]]
-    run_ends = np.r_[above_gate_indices[run_breaks], above_gate_indices[-1]]
-
-    # Merge runs separated by <= gap_samples into a single event.
-    gap_samples = int(gap_ms * sample_rate / 1000)
-    merged_runs: List[List[int]] = []
-    for run_start, run_end in zip(run_starts, run_ends):
-        if merged_runs and (run_start - merged_runs[-1][1] - 1) <= gap_samples:
-            merged_runs[-1][1] = run_end
-        else:
-            merged_runs.append([int(run_start), int(run_end)])
-
-    min_event_samples = int(min_event_ms * sample_rate / 1000)
-    events: List[Event] = []
-    for run_start, run_end in merged_runs:
-        if run_end - run_start + 1 < min_event_samples:
-            continue  # envelope blip shorter than MIN_EVENT_MS: not an event
-        excursion = voltage[run_start:run_end + 1]
-        dominant_idx_in_excursion = int(np.argmax(np.abs(excursion)))
-        dominant_sample = run_start + dominant_idx_in_excursion
-        if abs(voltage[dominant_sample]) < spike_gate:
-            continue  # no deflection strong enough to be a real spike
-        events.append(Event(onset=run_start, offset=run_end, center=dominant_sample))
-
-    return events, noise, gate, spike_gate
-
-
-def extract_event_window(
-    event: Event,
-    voltage: np.ndarray,
-    noise: float,
-    extent_sigmas: float = EXTENT_SIGMAS,
-    pad_fraction: float = PAD_FRACTION,
-    min_pad_s: float = MIN_PAD_S,
-    min_window_ms: float = MIN_WINDOW_MS,
-    sample_rate: int = SAMPLE_RATE_HZ,
-) -> Optional[Tuple[np.ndarray, float, int, int, int]]:
-    """Window around a whole event, centered on the dominant peak.
-
-    Formal description
-    ------------------
-    The *extent* is the contiguous span of samples around the event's
-    excursion [S_i, E_i] on which |v| stays above a LOW threshold:
-
-        [L_i, R_i] = maximal run containing [S_i, E_i] with |v| > e*sigma,
-
-    e = EXTENT_SIGMAS (default 2, vs the 5-sigma detection gate). This
-    captures the low-amplitude leading/trailing oscillations that fall below
-    the detection gate but are still part of the event.
-
-    The pad is proportional to the extent (adaptive: small spikes get small
-    margins, large spikes get large ones) but never below a floor:
-
-        pre = post = max(round(PAD_FRACTION * L_ext), round(MIN_PAD_S * fs)),
-        L_ext = R_i - L_i + 1.
-
-    The natural window spans
-
-        W_nat = L_ext + pre + post
-              = L_ext + 2*max(round(PAD_FRACTION*L_ext), round(MIN_PAD_S*fs)).
-
-    The extracted size is
-
-        W_i = max(W_nat, w_min),
-
-    with w_min = MIN_WINDOW_MS in samples. There is NO upper clipping: a
-    large extent is allowed to keep its full, proportionate window.
-
-    The window is CENTERED on the dominant deflection m_i:
-
-        start_i = m_i - floor(W_i/2),
-
-    so every event's peak lands at the same relative position (family sorting
-    requires this alignment), then clamped so [start_i, start_i + W_i) lies
-    within the trace.
-
-    Returns (waveform, t_i, W_i, start_i, r_i) with t_i = m_i/fs the event
-    time and r_i = m_i - start_i the peak offset within the window (should be
-    ~W_i/2), or None if W_i <= 0.
-    """
-    extent_start = event.onset
-    extent_end = event.offset
-    extent_threshold = extent_sigmas * noise
-    # Extend the excursion left/right while |v| stays above the low threshold;
-    # this recovers the low-amplitude leading/trailing oscillations.
-    while extent_start > 0 and abs(voltage[extent_start - 1]) > extent_threshold:
-        extent_start -= 1
-    while extent_end < len(voltage) - 1 and abs(voltage[extent_end + 1]) > extent_threshold:
-        extent_end += 1
-    extent_len = extent_end - extent_start + 1
-
-    # Adaptive symmetric padding: proportional to the extent, floored by
-    # MIN_PAD_S so short events still get a usable baseline on each side.
-    pad = max(int(round(pad_fraction * extent_len)), int(round(min_pad_s * sample_rate)))
-    min_window = int(min_window_ms * sample_rate / 1000)
-
-    natural_window = extent_len + 2 * pad
-    window_len = max(natural_window, min_window)
-    if window_len <= 0:
-        return None
-    
-    # Center the window on the dominant deflection so every event's peak lands
-    # at the same relative position (required for family sorting).
-    start = event.center - window_len // 2
-    start = int(max(0, min(start, len(voltage) - window_len)))
-    end = start + window_len
-
-    waveform = voltage[start:end].copy()
-    return (waveform, event.center / sample_rate, window_len, start, event.center - start)
-
-
 def process_channel(data: np.ndarray, channel: int) -> Dict[str, Any]:
-    """Full per-channel pipeline: detect events, extract one window each.
+    """Run the full per-channel pipeline: detect events, extract windows, smooth.
 
-    For channel k: v_k = data[:, k] * q (q = VOLTAGE_SCALE uV/LSB), then
-    detect_events() (MAD-based noise sigma) + extract_event_window() per
-    event. Every raw window is additionally smoothed with smooth_waveform()
-    at EVERY width in SMOOTH_WINDOWS_MS (Savitzky-Golay, polyorder
-    SMOOTH_POLYORDER); the raw window and all smoothed variants are returned
-    and later persisted, so downstream analysis and every visualization read
-    one source of truth (the saved arrays) and never re-derive anything at
-    render time.
+    Implements pipeline Steps 1-7 for a single channel: loads the raw
+    voltage, estimates noise, detects events, extracts centered windows,
+    and applies Savitzky-Golay smoothing at every persisted width. The
+    returned dictionary is the complete feature set for one channel and
+    is later persisted by save_waveforms().
 
-    Persisted features per event:
-      * spike_times       - event time t_i = m_i / fs          (seconds)
-      * window_sizes      - W_i (samples)
-      * peak_indices      - r_i = m_i - start_i (dominant-peak offset)
-      * window_starts     - start_i (absolute sample index)
-      * amplitudes        - signed dominant deflection v_k[m_i]  (uV)
+    Parameters
+    ----------
+    data : np.ndarray
+        int16 array of shape (T, 64) from load_raw_data().
+    channel : int
+        Channel index (0-63).
+
+    Returns
+    -------
+    Dict[str, Any]
+        Per-channel feature dictionary containing waveforms, smoothed
+        variants, spike times, window metadata, gate thresholds, and
+        noise estimate.
     """
     print(f"\nProcessing channel {channel}...")
     voltage = data[:, channel] * VOLTAGE_SCALE
@@ -534,29 +388,273 @@ def process_channel(data: np.ndarray, channel: int) -> Dict[str, Any]:
         "std_dev": noise,
         "n_events": len(events),
         "n_extracted": n_extracted,
-        # smoothing parameters used at extraction time, so re-renders can
-        # label the persisted data truthfully even if constants change later
         "smooth_method": SMOOTH_METHOD,
         "smooth_windows_ms": list(SMOOTH_WINDOWS_MS),
         "smooth_polyorder": SMOOTH_POLYORDER,
     }
 
 
-def save_waveforms(results: Dict[int, Dict[str, Any]], output_file: str, source_file: str) -> None:
-    """Persist all channels to a single self-describing .npz archive.
+def estimate_noise_mad(samples: np.ndarray) -> float:
+    """Estimate the noise standard deviation using the median absolute deviation.
 
-    Arrays are stored as N_ch object arrays (one row per channel) because
-    event counts and window lengths vary per channel:
-        waveforms[i]             : raw windows of channel i (list of np.ndarray)
-        smooth_waveforms_<w>ms[i]: Savitzky-Golay smoothed windows of channel
-                                   i at width w (one key per width in
-                                   SMOOTH_WINDOWS_MS)
-    plus per-channel integer/float arrays (spike_times, window_sizes, ...),
-    the smoothing widths actually used, and scalar metadata (fs, unit,
-    parameter constants, source file). The archive is therefore fully
-    self-describing for later analysis (spike_sorting.py) and re-rendering
-    (-v): every downstream consumer reads the saved arrays, never re-derives
-    them.
+    Robust alternative to the sample std that is insensitive to the
+    large-amplitude events present in the recording. This is the noise
+    estimator used throughout the pipeline (Steps 1-6).
+
+    sigma_hat = 1.4826 * median_n |x_n - median_m x_m|
+    where 1.4826 = 1 / Phi^{-1}(3/4)
+
+    Parameters
+    ----------
+    samples : np.ndarray
+        1-D array of voltage samples (e.g. one channel's full trace).
+
+    Returns
+    -------
+    float
+        Estimated noise standard deviation sigma_hat in the same units as
+        the input.
+    """
+    median = float(np.median(samples))
+    return float(1.4826 * np.median(np.abs(samples - median)))
+
+
+def detect_events(
+    voltage: np.ndarray,
+    noise_estimator: Callable[[np.ndarray], float] = estimate_noise_mad,
+    gate_scale: float = EVENT_GATE_SCALE,
+    spike_gate_scale: float = SPIKE_GATE_SCALE,
+    gap_ms: float = EVENT_GAP_MS,
+    min_event_ms: float = MIN_EVENT_MS,
+    sample_rate: int = SAMPLE_RATE_HZ,
+) -> Tuple[List[Event], float, float, float]:
+    """Segment a voltage trace into discrete events.
+
+    Implements pipeline Steps 2-5: apply an envelope gate to the absolute
+    voltage, find contiguous excursions above the gate, merge excursions
+    separated by small gaps (polyphasic spikes), then prune events that are
+    too short or whose dominant peak is too weak.
+
+    b[n] = 1{ |v[n]| > G * sigma }                                   (excursion mask)
+    E = { n : b[n] = 1 }                                             (excursion set)
+    [s_j, e_j] = maximal contiguous runs in E                        (runs)
+    [S_i, E_i] = merge(s_j, e_j) if gap_j <= tau                     (gap merge)
+    keep i iff (E_i - S_i + 1) >= D_min AND |v[m_i]| >= S * sigma    (event gate)
+    where m_i = argmax_{n in [S_i, E_i]} |v[n]|                      (dominant deflection)
+
+    Parameters
+    ----------
+    voltage : np.ndarray
+        1-D voltage trace in uV, one channel's full recording.
+    noise_estimator : Callable[[np.ndarray], float]
+        Function returning the noise standard deviation from a voltage array. MAD by default
+    gate_scale : float
+        Multiplier on noise for the low envelope gate (Step 2).
+    spike_gate_scale : float
+        Multiplier on noise for the high spike gate (Step 5).
+    gap_ms : float
+        Maximum gap in ms between consecutive excursions to merge them (Step 4).
+    min_event_ms : float
+        Minimum event duration in samples to keep (Step 5).
+    sample_rate : int
+        Sampling rate in Hz.
+
+    Returns
+    -------
+    Tuple[List[Event], float, float, float]
+        (events, noise, gate, spike_gate) where events is the list of
+        detected events, noise is the estimated MAD, gate is the envelope
+        threshold, and spike_gate is the dominant-peak threshold.
+    """
+    noise = float(noise_estimator(voltage))
+    gate = gate_scale * noise
+    spike_gate = spike_gate_scale * noise
+
+    # Samples whose |amplitude| clears the low envelope gate.
+    above_gate_indices = np.flatnonzero(np.abs(voltage) > gate)
+    if len(above_gate_indices) == 0:
+        return [], noise, gate, spike_gate
+
+    # Maximal contiguous runs within the excursion set.
+    run_breaks = np.flatnonzero(np.diff(above_gate_indices) > 1)
+    run_starts = np.r_[above_gate_indices[0], above_gate_indices[run_breaks + 1]]
+    run_ends = np.r_[above_gate_indices[run_breaks], above_gate_indices[-1]]
+
+    # Merge runs separated by <= gap_samples into a single event.
+    gap_samples = int(gap_ms * sample_rate / 1000)
+    merged_runs: List[List[int]] = []
+    for run_start, run_end in zip(run_starts, run_ends):
+        if merged_runs and (run_start - merged_runs[-1][1] - 1) <= gap_samples:
+            merged_runs[-1][1] = run_end
+        else:
+            merged_runs.append([int(run_start), int(run_end)])
+
+    min_event_samples = int(min_event_ms * sample_rate / 1000)
+    events: List[Event] = []
+    for run_start, run_end in merged_runs:
+        # envelope blip shorter than MIN_EVENT_MS: not an event
+        if run_end - run_start + 1 < min_event_samples:
+            continue
+        
+        excursion = voltage[run_start:run_end + 1]
+        dominant_idx_in_excursion = int(np.argmax(np.abs(excursion)))
+        dominant_sample = run_start + dominant_idx_in_excursion
+
+        # no deflection strong enough to be a real spike: not an event
+        if abs(voltage[dominant_sample]) < spike_gate:
+            continue
+
+        events.append(Event(onset=run_start, offset=run_end, center=dominant_sample))
+    return events, noise, gate, spike_gate
+
+
+def extract_event_window(
+    event: Event,
+    voltage: np.ndarray,
+    noise: float,
+    extent_sigmas: float = EXTENT_SIGMAS,
+    pad_fraction: float = PAD_FRACTION,
+    min_pad_s: float = MIN_PAD_S,
+    min_window_ms: float = MIN_WINDOW_MS,
+    sample_rate: int = SAMPLE_RATE_HZ,
+) -> Optional[Tuple[np.ndarray, float, int, int, int]]:
+    """Extract a fixed-width window around an event, centered on its dominant peak.
+
+    Implements pipeline Step 6: grow the event's excursion into an extent
+    that captures leading/trailing oscillations, add adaptive padding, then
+    center a window on the dominant deflection. The window is clamped to the
+    trace boundaries so it never extends outside the recording.
+
+    [L_i, R_i] = grow [S_i, E_i] while |v[n]| > e * sigma           (extent)
+    L_ext = R_i - L_i + 1
+    pad = max( round(PAD_FRACTION * L_ext), round(MIN_PAD_S * fs) )
+    W_i = max( L_ext + 2*pad, w_min )                               (window size)
+    start_i = clamp( m_i - floor(W_i/2), 0, N - W_i )               (centered)
+
+    Parameters
+    ----------
+    event : Event
+        Detected event with onset, offset, and center sample indices.
+    voltage : np.ndarray
+        1-D voltage trace in uV.
+    noise : float
+        Noise standard deviation (from detect_events).
+    extent_sigmas : float
+        Multiplier on noise for the low threshold that defines the extent.
+    pad_fraction : float
+        Fraction of the extent length to add as padding on each side.
+    min_pad_s : float
+        Minimum padding in seconds (floor for short events).
+    min_window_ms : float
+        Minimum window length in ms.
+    sample_rate : int
+        Sampling rate in Hz.
+
+    Returns
+    -------
+    Optional[Tuple[np.ndarray, float, int, int, int]]
+        (waveform, event_time, window_len, start_idx, peak_offset) if
+        extraction succeeds, None if the window length is non-positive.
+        event_time is in seconds, peak_offset is the dominant-peak position
+        within the extracted window.
+    """
+    extent_start = event.onset
+    extent_end = event.offset
+    extent_threshold = extent_sigmas * noise
+
+    # Extend the excursion left/right while |v| stays above the low threshold;
+    # this recovers the low-amplitude leading/trailing oscillations.
+    while extent_start > 0 and abs(voltage[extent_start - 1]) > extent_threshold:
+        extent_start -= 1
+    while extent_end < len(voltage) - 1 and abs(voltage[extent_end + 1]) > extent_threshold:
+        extent_end += 1
+    extent_len = extent_end - extent_start + 1
+
+    # Adaptive symmetric padding: proportional to the extent, floored by
+    # MIN_PAD_S so short events still get a usable baseline on each side.
+    pad = max(int(round(pad_fraction * extent_len)), int(round(min_pad_s * sample_rate)))
+    min_window = int(min_window_ms * sample_rate / 1000)
+
+    # Calculate window size
+    natural_window = extent_len + 2 * pad
+    window_len = max(natural_window, min_window)
+    if window_len <= 0:
+        return None
+    
+    # Center the window on the dominant deflection so every event's peak lands
+    # at the same relative position (required for family sorting).
+    start = event.center - window_len // 2
+    start = int(max(0, min(start, len(voltage) - window_len)))
+    end = start + window_len
+
+    waveform = voltage[start:end].copy()
+    return (waveform, event.center / sample_rate, window_len, start, event.center - start)
+
+
+def smooth_waveform(waveform: np.ndarray,
+                    method: str = SMOOTH_METHOD,
+                    window_ms: float = SMOOTH_WINDOWS_MS[0],
+                    polyorder: int = SMOOTH_POLYORDER,
+                    sample_rate: int = SAMPLE_RATE_HZ) -> np.ndarray:
+    """Apply zero-phase Savitzky-Golay smoothing to a waveform window.
+
+    Implements pipeline Step 7: fit a least-squares polynomial to a symmetric
+    window around each sample and take the fitted value at the center. The
+    symmetric kernel guarantees zero-phase filtering (peak locations cannot
+    shift). Called once per (window, width) during extraction; smoothed
+    variants are persisted alongside the raw window.
+
+    L = max( round(w * fs / 1000) | 1, p + 1 )   (kernel length, forced odd)
+    y[n] = sum_{j=-L//2}^{L//2} c_j * x[n + j]   (convolution with SG weights)
+
+    Parameters
+    ----------
+    waveform : np.ndarray
+        1-D raw waveform window in uV.
+    method : str
+        "savgol" to apply smoothing, "none" to return the input unchanged.
+    window_ms : float
+        Savitzky-Golay window width in ms.
+    polyorder : int
+        Polynomial order for the Savitzky-Golay filter.
+    sample_rate : int
+        Sampling rate in Hz.
+
+    Returns
+    -------
+    np.ndarray
+        Smoothed waveform (same length as input).
+    """
+    if method != "savgol":
+        return waveform
+    window_len = int(round(window_ms * sample_rate / 1000)) | 1  # force odd
+    window_len = max(window_len, polyorder + 1)
+    if window_len % 2 == 0:
+        window_len += 1
+    if window_len < 3 or window_len >= len(waveform):
+        return waveform
+    return np.asarray(scipy.signal.savgol_filter(waveform, window_len, polyorder), dtype=float)
+
+
+def save_waveforms(results: Dict[int, Dict[str, Any]], output_file: str, source_file: str) -> None:
+    """Persist all channel results to a self-describing .npz archive.
+
+    Writes every channel's raw windows, smoothed variants, spike times,
+    and gate thresholds into a single compressed archive. The archive
+    is self-describing: it stores the smoothing parameters, sample rate,
+    and voltage scale used at extraction time, so later re-rendering (-v)
+    and downstream analysis (spike_sorting.py) can read the saved data
+    without re-deriving anything.
+
+    Parameters
+    ----------
+    results : Dict[int, Dict[str, Any]]
+        Per-channel feature dictionaries (output of process_channel).
+    output_file : str
+        Path to write the .npz archive.
+    source_file : str
+        Path to the original raw binary (stored in the archive for
+        provenance).
     """
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -628,11 +726,23 @@ def save_waveforms(results: Dict[int, Dict[str, Any]], output_file: str, source_
 
 
 def load_waveforms(output_file: str) -> Dict[int, Dict[str, Any]]:
-    """Inverse of save_waveforms(): reconstruct the per-channel dict from .npz.
+    """Load a previous run's .npz archive back into per-channel dicts.
 
-    Repopulates each channels data from a previous run so it 
-    can be re-rendered (-v) without re-reading the
-    raw binary and without re-deriving any waveform.
+    Inverse of save_waveforms(). Reconstructs the results dictionary from
+    a prior extraction so it can be re-rendered (-v) without re-reading
+    the raw binary or re-deriving any waveforms. Handles legacy archives
+    that predate multi-width smoothing.
+
+    Parameters
+    ----------
+    output_file : str
+        Path to a waveforms.npz archive from a previous run.
+
+    Returns
+    -------
+    Dict[int, Dict[str, Any]]
+        Per-channel feature dictionaries identical to what process_channel
+        returns, or an empty dict if the file does not exist.
     """
     output_path = Path(output_file)
     if not output_path.exists():
@@ -693,52 +803,24 @@ def load_waveforms(output_file: str) -> Dict[int, Dict[str, Any]]:
     return results
 
 
-def smooth_waveform(waveform: np.ndarray,
-                    method: str = SMOOTH_METHOD,
-                    window_ms: float = SMOOTH_WINDOWS_MS[0],
-                    polyorder: int = SMOOTH_POLYORDER,
-                    sample_rate: int = SAMPLE_RATE_HZ) -> np.ndarray:
-    """Zero-phase Savitzky-Golay smoothing applied at extraction time.
-
-    For every sample, fit a least-squares polynomial of degree `polyorder`
-    to the symmetric window around it and take the fitted value at the
-    center. The kernel is symmetric, so the filter is zero-phase by
-    construction: peak locations cannot shift relative to the raw waveform.
-    The polynomial fit tracks the smooth macro deflection and discards
-    high-frequency noise, keeping peak amplitudes ~intact (a moving average
-    or FIR low-pass would flatten peaks and round corners).
-
-    Called once per (window, width) in process_channel(); the smoothed
-    results are persisted next to the raw window in the npz (single source
-    of truth) and are read back by the visualizations - they are never
-    recomputed at render time. `method == "none"` returns the input
-    unchanged.
-    """
-    if method != "savgol":
-        return waveform
-    window_len = int(round(window_ms * sample_rate / 1000)) | 1  # force odd
-    window_len = max(window_len, polyorder + 1)
-    if window_len % 2 == 0:
-        window_len += 1
-    if window_len < 3 or window_len >= len(waveform):
-        return waveform
-    return np.asarray(scipy.signal.savgol_filter(waveform, window_len, polyorder), dtype=float)
-
-
 def _resolve_run_paths(args: argparse.Namespace) -> Tuple[Path, Path, str, str, Path]:
     """Determine the run directory and all output paths.
 
-    Normal run: creates a fresh timestamped run dir
-        <OUTPUT_ROOT>/<YYYY-MM-DD_HH-MM-SS>/
-    so every invocation is archived for iteration tracking (old runs are
-    never overwritten).
+    Normal run: creates a fresh timestamped directory under OUTPUT_ROOT so
+    every invocation is archived for iteration tracking. Visualize-only (-v):
+    re-derives the run dir from the supplied .npz path so HTML is rewritten
+    in place.
 
-    Visualize-only (-v): re-derives the run dir from the supplied .npz path.
-    If the npz lives at <run_dir>/waveforms/waveforms.npz the run dir is
-    npz.parent.parent; otherwise npz.parent is used. HTML is (re)written
-    into <run_dir>/html/, so a previous run can be rendered in place.
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments (data_file, output, out_root, spike_html,
+        channel_html, visualize_only).
 
-    Returns (run_dir, npz_path, grid_path, channel_path, html_dir).
+    Returns
+    -------
+    Tuple[Path, Path, str, str, Path]
+        (run_dir, npz_path, grid_path, channel_path, html_dir)
     """
     if args.visualize_only:
         if not args.output:
@@ -760,9 +842,22 @@ def _resolve_run_paths(args: argparse.Namespace) -> Tuple[Path, Path, str, str, 
 
 
 def _write_run_meta(run_dir: Path, args: argparse.Namespace, results: Dict[int, Dict[str, Any]], npz_path: Path) -> None:
-    """Write run_meta.json: parameters, timestamps and per-channel summary.
+    """Write run_meta.json with parameters, timestamps, and per-channel summary.
 
-    Mirrors the constants in this module so any archived run can be fully reconstructed / cross-referenced.
+    Mirrors the constants used at extraction time so any archived run can
+    be fully reconstructed or cross-referenced during writing of the
+    methods section.
+
+    Parameters
+    ----------
+    run_dir : Path
+        Root directory for this run's outputs.
+    args : argparse.Namespace
+        Parsed CLI arguments (data_file, etc.).
+    results : Dict[int, Dict[str, Any]]
+        Per-channel feature dictionaries.
+    npz_path : Path
+        Path to the saved waveforms.npz.
     """
     per_channel = {}
     for channel in sorted(results.keys()):

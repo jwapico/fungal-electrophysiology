@@ -42,6 +42,18 @@ INTERACTIVE_HTML_PATTERN: str = "channel_{ch}_interactive.html"
 
 
 def _html_head(title: str) -> List[str]:
+    """Return the opening HTML tags with a standard stylesheet.
+
+    Parameters
+    ----------
+    title : str
+        Page title and h1 heading text.
+
+    Returns
+    -------
+    List[str]
+        List of HTML strings to start the document.
+    """
     return [
         "<!DOCTYPE html>", "<html>", "<head>",
         "    <title>MEA Spike Waveforms</title>",
@@ -67,6 +79,15 @@ def _html_head(title: str) -> List[str]:
 
 
 def _write_html(output_file: str, html_parts: List[str]) -> None:
+    """Join HTML parts and write to a file.
+
+    Parameters
+    ----------
+    output_file : str
+        Output path for the HTML file.
+    html_parts : List[str]
+        List of HTML strings to join with newlines.
+    """
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(html_parts))
@@ -75,6 +96,22 @@ def _write_html(output_file: str, html_parts: List[str]) -> None:
 
 def _figure_to_base64(fig: Figure, dpi: int = FIGURE_DPI,
                       tight: bool = True) -> str:
+    """Encode a matplotlib figure as a base64 PNG string.
+
+    Parameters
+    ----------
+    fig : Figure
+        Matplotlib figure to render.
+    dpi : int
+        Resolution in dots per inch.
+    tight : bool
+        If True, use bbox_inches='tight' to trim whitespace.
+
+    Returns
+    -------
+    str
+        Base64-encoded PNG image data suitable for inline HTML img tags.
+    """
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight" if tight else None)
     plt.close(fig)
@@ -86,11 +123,22 @@ def _figure_to_base64(fig: Figure, dpi: int = FIGURE_DPI,
 
 def _save_figure_png(fig: Figure, output_path: Path, dpi: int = FIGURE_DPI,
                      tight: bool = True) -> None:
-    """Render a figure to a PNG file (used for per-event grid tiles).
+    """Render a matplotlib figure to a PNG file.
 
-    Rendered with the same bbox/dpi handling as _figure_to_base64 so the
-    on-disk tiles look identical to the embedded ones; the array data that
-    produced them is the persisted npz array (no loss).
+    Used for writing per-event grid tiles to disk so the HTML page stays
+    small and all smoothing variants are available without inflating the
+    file to gigabytes.
+
+    Parameters
+    ----------
+    fig : Figure
+        Matplotlib figure to render.
+    output_path : Path
+        Destination path for the PNG file.
+    dpi : int
+        Resolution in dots per inch.
+    tight : bool
+        If True, use bbox_inches='tight' to trim whitespace.
     """
     fig.savefig(output_path, format="png", dpi=dpi,
                 bbox_inches="tight" if tight else None)
@@ -100,14 +148,30 @@ def _save_figure_png(fig: Figure, output_path: Path, dpi: int = FIGURE_DPI,
 def _tile_figure(waveform: np.ndarray, start_idx: int, peak_idx: int,
                  sample_rate: int = 30000,
                  ylim: Optional[Tuple[float, float]] = None) -> Figure:
-    """Build one small tile figure for a single event window.
+    """Build a small tile figure for a single event window.
 
-    Axes:
-      * x-axis = absolute recording time in seconds, x[n] = (start_idx + n)/fs,
-        so the dominant peak appears at its true recording time t_i = m_i/fs.
-      * y-axis = window voltage (uV), with ticks drawn at the window's min
-        and max values (dashed horizontal lines) so peak-to-peak is read
-        directly off the tile.
+    Creates a compact plot with x-axis in absolute recording time (seconds)
+    and y-axis showing the window voltage. The dominant peak is marked with
+    a dashed vertical line; red dotted horizontal lines mark the window
+    min/max so peak-to-peak amplitude is readable directly from the tile.
+
+    Parameters
+    ----------
+    waveform : np.ndarray
+        1-D extracted window in uV.
+    start_idx : int
+        Absolute sample index where the window starts in the full trace.
+    peak_idx : int
+        Offset of the dominant peak within the window.
+    sample_rate : int
+        Sampling rate in Hz.
+    ylim : Optional[Tuple[float, float]]
+        Fixed y-axis bounds (min, max). If None, computed from the waveform.
+
+    Returns
+    -------
+    Figure
+        Matplotlib figure object (caller must close or save).
     """
     fig, ax = plt.subplots(figsize=(1.7, 1.15))
     time_axis = (start_idx + np.arange(len(waveform))) / sample_rate
@@ -142,23 +206,43 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
                             smooth_windows_ms_default: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0),
                             smooth_polyorder_default: int = 4,
                             smooth_show_by_default: bool = False) -> None:
-    """Render the flex CSS-grid of per-event tiles, one tile per waveform.
+    """Render a flex CSS grid of per-event waveform tiles.
 
-    Each tile is a small standalone PNG (see _tile_figure) wrapped in an
-    <a> that deep-links to the channel's interactive view zoomed on that
-    event. The grid uses CSS auto-fill so tiles reflow with the browser
-    width (responsive/flex layout); no image maps are needed.
+    Each tile is a standalone PNG (see _tile_figure) wrapped in a link to the
+    channel's interactive view zoomed on that event. A radio selector at the
+    top toggles between raw and smoothed variants via a CSS body class. A
+    per-channel checkbox limits visible tiles to the first N.
 
-    Every tile embeds the raw window plus one PNG per persisted smoothing
-    width (all read from the npz via results[]; never recomputed). A radio
-    selector at the top chooses which variant is displayed, toggled via a
-    body class.
-
-    A per-channel checkbox (checked by default) applies a CSS class that
-    hides every tile beyond the first `spike_windows_limit` for THAT channel
-    only, and unchecking it reveals all of them. The limit value is injected
-    into the CSS from the module constant SPIKE_WINDOWS_LIMIT, so the visible
-    cutoff always follows the code.
+    Parameters
+    ----------
+    results : Dict[int, Dict[str, Any]]
+        Per-channel feature dictionaries (from load_waveforms or process_channel).
+    output_file : str
+        Path to write the HTML grid file.
+    interactive_pattern : str
+        Filename pattern for interactive HTML files (with {ch} placeholder).
+    interactive_dir : str
+        Directory containing interactive HTML files (relative to HTML root).
+    spike_windows_limit : int
+        Default number of tiles shown per channel before toggling.
+    dpi : int
+        Resolution for tile PNGs.
+    context_ms : float
+        Context margin (ms) around each event for the interactive deep-link.
+    sample_rate : int
+        Sampling rate in Hz.
+    event_gate_scale : float
+        Envelope gate multiplier (for display labels).
+    spike_gate_scale : float
+        Spike gate multiplier (for display labels).
+    smooth_method_default : str
+        Fallback smoothing method if results are empty.
+    smooth_windows_ms_default : Tuple[float, ...]
+        Fallback smoothing widths if results are empty.
+    smooth_polyorder_default : int
+        Fallback polynomial order if results are empty.
+    smooth_show_by_default : bool
+        If True, default to the first smoothed variant instead of raw.
     """
     print(f"\nGenerating waveform grid HTML: {output_file}")
 
@@ -315,13 +399,34 @@ def gen_channel_html(results: Dict[int, Dict[str, Any]],
                      event_gate_scale: float = 5.0,
                      spike_gate_scale: float = 5.0,
                      trace_dpi: int = TRACE_DPI) -> None:
-    """Render one full-trace figure per channel (downsampled overview).
+    """Render a full-trace overview for every channel (downsampled PNG).
 
-    The trace is decimated by CHANNEL_DS_FACTOR (y -> y[::ds]) for a light
-    PNG; detected dominant peaks are overlaid as red dots and the two gates
-    (envelope gate = event_gate_scale x noise, spike gate = spike_gate_scale
-    x noise, both derived from the module constants) are drawn as dashed
-    lines. Purely visual, no analysis.
+    Produces a compact overview where each channel's full recording is
+    decimated by `ds_factor` and plotted as a line with detected dominant
+    peaks overlaid as red dots. The two gate thresholds (event and spike)
+    are shown as dashed lines for visual confirmation of the gating
+    criteria.
+
+    Parameters
+    ----------
+    results : Dict[int, Dict[str, Any]]
+        Per-channel feature dictionaries.
+    output_file : str
+        Path to write the HTML overview file.
+    raw_data : np.ndarray
+        Raw int16 array of shape (T, 64) from load_raw_data().
+    ds_factor : int
+        Decimation factor for the trace PNGs.
+    sample_rate : int
+        Sampling rate in Hz.
+    voltage_scale : float
+        Conversion factor from LSB to uV.
+    event_gate_scale : float
+        Envelope gate multiplier (for display labels).
+    spike_gate_scale : float
+        Spike gate multiplier (for display labels).
+    trace_dpi : int
+        Resolution for trace PNGs.
     """
     print(f"\nGenerating full-trace HTML: {output_file}")
     html_parts = _html_head("MEA Channel Traces")
@@ -397,16 +502,39 @@ def gen_channel_interactive_html(results: Dict[int, Dict[str, Any]],
                                  sample_rate: int = 30000,
                                  event_gate_scale: float = 5.0,
                                  spike_gate_scale: float = 5.0) -> None:
-    """One self-contained plotly view per channel, with click-to-zoom.
+    """Render a self-contained interactive plotly view for a single channel.
 
-    The plot stacks (1) a heavily downsampled full-trace overview
-    (decimation INTERACTIVE_OVERVIEW_DS), (2) high-resolution context
-    segments around every detected peak (windowed +/- SPIKE_CONTEXT_MS,
-    decimation INTERACTIVE_SPIKE_DS, joined with NaN gaps so plotly draws
-    no connecting line across the spaces between segments), and (3) red
-    markers at the dominant peaks. The URL query ?t0=..&t1=.. selects the
-    initial x-axis range (used by the grid tiles) via a JS snippet injected
-    before </body>:  Plotly.relayout('interactive', {'xaxis.range': [t0, t1]}).
+    Stacks three layers: (1) a downsampled full-trace overview, (2) high-
+    resolution context segments around every detected peak joined with NaN
+    gaps so plotly draws no connecting lines across inter-segment spaces,
+    and (3) red markers at the dominant peaks. A JS snippet reads URL query
+    params `?t0=..&t1=..` to set the initial x-axis range (used by the grid
+    tile deep-links).
+
+    Parameters
+    ----------
+    results : Dict[int, Dict[str, Any]]
+        Per-channel feature dictionaries.
+    channel : int
+        Channel index to render.
+    voltage : np.ndarray
+        1-D voltage array (uV) for the channel.
+    output_file : str
+        Path to write the interactive HTML file.
+    overview_ds : int
+        Decimation factor for the full-trace overview.
+    spike_ds : int
+        Decimation factor for high-res spike context segments.
+    context_ms : float
+        Context window (ms) around each peak.
+    plotly_js : str
+        Plotly JS library content (base64-encoded).
+    sample_rate : int
+        Sampling rate in Hz.
+    event_gate_scale : float
+        Envelope gate multiplier (for display labels).
+    spike_gate_scale : float
+        Spike gate multiplier (for display labels).
     """
     import plotly.graph_objects as go
 
@@ -499,12 +627,24 @@ def gen_channel_interactive_html(results: Dict[int, Dict[str, Any]],
 
 
 def _find_run_dirs(output_root: Path, timestamp_format: str) -> List[Path]:
-    """All timestamped run directories under output_root, newest first.
+    """List all timestamped run directories under output_root (newest first).
 
-    A run dir is a direct child whose name parses as timestamp_format
+    A run dir is a direct child whose name parses as `timestamp_format`
     (e.g. 2026-08-15_12-00-00). The fixed-width timestamp compares
-    lexicographically in chronological order, so sorting on the name alone
+    lexicographically in chronological order, so sorting on name alone
     puts the newest run first.
+
+    Parameters
+    ----------
+    output_root : Path
+        Root directory containing timestamped run subdirectories.
+    timestamp_format : str
+        strptime-compatible format string for run directory names.
+
+    Returns
+    -------
+    List[Path]
+        Run directories sorted newest-first.
     """
     runs = []
     for candidate in output_root.iterdir():
@@ -520,16 +660,30 @@ def _find_run_dirs(output_root: Path, timestamp_format: str) -> List[Path]:
 
 
 def write_output_index(output_path: Path, output_root: Path,
-                       timestamp_format: str, run_meta_filename: str) -> None:
+                       timestamp_format: str, run_meta_filename: str) -> Path:
     """Regenerate the static entry-point index.html for all runs.
 
-    The index is written to output_path/index.html (the script directory),
-    while the runs it links to live under output_root. Called at the end of
-    every run (fresh extraction and -v re-render), so the newest run's pages
-    are always one click away when the index is opened from disk -- plain
-    relative links, no server or JavaScript required. The newest run is
-    listed first with links to its waveform grid, all-channels view and run
-    metadata; every older run follows with the same links.
+    Writes `output_path/index.html` with relative links to every archived
+    run's waveform grid, all-channels view, and run metadata. The newest
+    run is listed first. Called at the end of every run (fresh extraction
+    and -v re-render) so the latest pages are always one click away from
+    the index opened from disk -- plain relative links, no server or JS.
+
+    Parameters
+    ----------
+    output_path : Path
+        Directory where index.html is written (the script directory).
+    output_root : Path
+        Root directory containing timestamped run subdirectories.
+    timestamp_format : str
+        strptime-compatible format string for run directory names.
+    run_meta_filename : str
+        Filename for the run metadata JSON (e.g. "run_meta.json").
+
+    Returns
+    -------
+    Path
+        Path to the generated index.html file.
     """
     runs = _find_run_dirs(output_root, timestamp_format)
     latest = runs[0] if runs else None
@@ -604,5 +758,8 @@ def write_output_index(output_path: Path, output_root: Path,
 </body>
 </html>
 """
-    (output_path / "index.html").write_text(html)
-    print(f"Updated output index: {output_path / 'index.html'}")
+    
+    index_filepath = output_path / "index.html"
+    index_filepath.write_text(html)
+    print(f"Updated output index: {index_filepath}")
+    return index_filepath
