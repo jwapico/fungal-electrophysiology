@@ -110,19 +110,19 @@ Output layout: each run writes into its own timestamped directory
 
 waveforms.npz schema (np.savez_compressed):
     Scalar metadata (saved as 0-d arrays or Python scalars):
-      sample_rate               int                   fs (Hz)
-      unit                      str                   "uV"
-      source_file               str                   path to the raw binary
-      min_window_ms             float                 MIN_WINDOW_MS
-      min_pad_s                 float                 MIN_PAD_S
-      pad_fraction              float                 PAD_FRACTION
-      extent_sigmas             float                 EXTENT_SIGMAS
-      event_gate_scale          float                 EVENT_GATE_SCALE
-      spike_gate_scale          float                 SPIKE_GATE_SCALE
-      smooth_method             str                   "savgol" or "none"
-      smooth_windows_ms         float64 (W,)          persisted smoothing widths in ms
-      smooth_polyorder          int                   Savitzky-Golay polynomial order
-      smooth_show_by_default    bool                  grid default variant
+      sample_rate               int                    fs (Hz)
+      unit                      str                    "uV"
+      source_file               str                    path to the raw binary
+      min_window_ms             float                  MIN_WINDOW_MS
+      min_pad_s                 float                  MIN_PAD_S
+      pad_fraction              float                  PAD_FRACTION
+      extent_sigmas             float                  EXTENT_SIGMAS
+      event_gate_scale          float                  EVENT_GATE_SCALE
+      spike_gate_scale          float                  SPIKE_GATE_SCALE
+      smooth_method             str                    "savgol" or "none"
+      smooth_windows_ms         float64 (W,)           persisted smoothing widths in ms
+      smooth_polyorder          int                    Savitzky-Golay polynomial order
+      smooth_show_by_default    bool                   grid default variant
 
     Per-channel scalar arrays (dtype=float64 or int64, shape=(N_ch,)):
       thresholds                float64 (N_ch,)        spike gate per channel (S * sigma_k)
@@ -181,13 +181,11 @@ from visualization_tools import (
 
 # ---------------- dataset constants ----------------
 RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_control_0_cut800s.bin"     # https://zenodo.org/records/17588964
-#   - Extracellular electrophysiological effects on MEA recordings of living mycelium following in-vivo polydopamine polymerisation - Adamatzky
 RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_0_mycelium.bin"            # https://zenodo.org/records/17633358
-#   - Millisecond spikes in MEA recording of dispersed mycelium absent in dehydration and fungicidal assays - Adamatzky
-SAMPLE_RATE_HZ: int = 30000
-NUM_CHANNELS: int = 64
-VOLTAGE_SCALE: float = 0.195
-BINARY_DTYPE: str = "int16"
+SAMPLE_RATE_HZ: int = 30000                     # 30 kHz sample rate, as described in the papers
+NUM_CHANNELS: int = 64                          # 8x8 MEA as described in the papers outline the collection of above datasets
+VOLTAGE_SCALE: float = 0.195                    # uV per int16 LSB - Intan RHD2164 downscale factor
+BINARY_DTYPE: str = "int16"                     # raw binary format of the MEA recordings
 
 # ---------------- event segmentation ----------------
 EVENT_GATE_SCALE: float = 5.0                   # low envelope gate  (x noise)
@@ -201,11 +199,11 @@ PAD_FRACTION: float = 0.25                      # pre/post pad = this fraction o
 MIN_PAD_S: float = 0.02                         # floor on the pre/post pad (seconds): the window always extends at least this far each side
 MIN_WINDOW_MS: float = 3.0                      # floor on the total window length (ms): the window always extends at least this far total
 
-# --------- persisted waveform smoothing ------------
-SMOOTH_METHOD: str = "savgol"                                   # "savgol" | "none"
-SMOOTH_WINDOWS_MS: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)     # savgol widths (ms)
-SMOOTH_POLYORDER: int = 4                                       # savgol polynomial order
-SMOOTH_SHOW_BY_DEFAULT: bool = False                            # grid default: raw shown
+# -------------- waveform smoothing -----------------
+SMOOTH_METHOD: str = "savgol"                                                   # "savgol" | "none"
+SMOOTH_WINDOWS_MS: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)                     # savgol widths (ms)
+SMOOTH_POLYORDER: int = 4                                                       # savgol polynomial order
+SMOOTH_SHOW_BY_DEFAULT: bool = False                                            # grid default: raw shown
 
 # ------------------ output paths -------------------
 OUTPUT_ROOT: str = "outputs"
@@ -226,13 +224,13 @@ def main(args: argparse.Namespace) -> None:
     run_dir, npz_path, grid_path, channel_path, html_dir = _resolve_run_paths(args)
     interactive_dir = html_dir / INTERACTIVE_HTML_DIR
 
-    print("=" * 60)
+    print("=" * 120)
     print("MEA Spike Waveform Pipeline (event-based)")
-    print("=" * 60)
+    print("=" * 120)
     print(f"Data file:  {args.data_file}")
     print(f"Run dir:    {run_dir}")
     print(f"Waveforms:  {npz_path}")
-    print("=" * 60)
+    print("=" * 120)
 
     raw_data = load_raw_data(args.data_file)
 
@@ -262,6 +260,7 @@ def main(args: argparse.Namespace) -> None:
 
     gen_spike_waveform_html(
         results, str(grid_path),
+        source_file=args.data_file,
         interactive_pattern=INTERACTIVE_HTML_PATTERN,
         interactive_dir=INTERACTIVE_HTML_DIR,
         sample_rate=SAMPLE_RATE_HZ,
@@ -274,6 +273,7 @@ def main(args: argparse.Namespace) -> None:
     )
     
     gen_channel_html(results, str(channel_path), raw_data,
+                     source_file=args.data_file,
                      sample_rate=SAMPLE_RATE_HZ,
                      voltage_scale=VOLTAGE_SCALE,
                      event_gate_scale=EVENT_GATE_SCALE,
@@ -282,10 +282,10 @@ def main(args: argparse.Namespace) -> None:
     
     index_filepath = write_output_index(Path(os.path.dirname(os.path.abspath(__file__))), Path(args.out_root), TIMESTAMP_FORMAT, RUN_META_FILENAME)
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 120)
     print("DONE!")
     print(f"Open {index_filepath} in your browser")
-    print("=" * 60)
+    print("=" * 120)
 
 
 def load_raw_data(filepath: str) -> np.ndarray:

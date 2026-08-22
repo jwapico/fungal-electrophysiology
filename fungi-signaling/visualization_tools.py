@@ -27,18 +27,17 @@ from matplotlib.figure import Figure
 import numpy as np
 
 # ---------------- visualization constants ----------------
-CHANNEL_DS_FACTOR: int = 10
-SPIKE_WINDOWS_LIMIT: int = 50  # default # of waveform tiles shown per channel in the grid; a page toggle reveals all of them
-FIGURE_DPI: int = 80
-TILE_DPI: int = 120          # dpi of the per-event grid tiles
-TRACE_DPI: int = 100
-INTERACTIVE_OVERVIEW_DS: int = 200
-INTERACTIVE_SPIKE_DS: int = 4
-SPIKE_CONTEXT_MS: float = 200.0
-INTERACTIVE_CONTEXT_MS: float = 100.0
-PLOTLY_JS: str = "cdn"
-INTERACTIVE_HTML_DIR: str = "interactive_ch_views"
-INTERACTIVE_HTML_PATTERN: str = "channel_{ch}_interactive.html"
+CHANNEL_DS_FACTOR: int = 10            # decimation factor for the full-trace overview PNGs (y[::ds]) to keep file sizes small
+SPIKE_WINDOWS_LIMIT: int = 50          # default # of waveform tiles shown per channel in the grid before the toggle reveals all
+FIGURE_DPI: int = 80                   # DPI for base64-encoded figures embedded in HTML (channel overview)
+TILE_DPI: int = 120                    # DPI for per-event grid tile PNGs (higher than overview since tiles are small)
+TRACE_DPI: int = 100                   # DPI for full-trace channel overview PNGs
+INTERACTIVE_OVERVIEW_DS: int = 200     # decimation factor for the full-trace layer in the plotly interactive view
+INTERACTIVE_SPIKE_DS: int = 4          # decimation factor for the high-res spike context segments in the plotly view
+SPIKE_CONTEXT_MS: float = 200.0        # ms window around each peak for the high-res context segments (used in gen_spike_waveform_html)
+INTERACTIVE_CONTEXT_MS: float = 100.0  # ms context margin for the interactive deep-link zoom from grid tile clicks
+INTERACTIVE_HTML_DIR: str = "interactive_ch_views"  # subdirectory under html/ for per-channel interactive files
+INTERACTIVE_HTML_PATTERN: str = "channel_{ch}_interactive.html"  # filename template for interactive HTML ({ch} replaced at write time)
 
 
 def _html_head(title: str) -> List[str]:
@@ -194,6 +193,7 @@ def _tile_figure(waveform: np.ndarray, start_idx: int, peak_idx: int,
 
 def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
                             output_file: str,
+                            source_file: str = "",
                             interactive_pattern: str = INTERACTIVE_HTML_PATTERN,
                             interactive_dir: str = INTERACTIVE_HTML_DIR,
                             spike_windows_limit: int = SPIKE_WINDOWS_LIMIT,
@@ -219,6 +219,8 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
         Per-channel feature dictionaries (from load_waveforms or process_channel).
     output_file : str
         Path to write the HTML grid file.
+    source_file : str
+        Path to the original raw dataset (displayed at the top of the page).
     interactive_pattern : str
         Filename pattern for interactive HTML files (with {ch} placeholder).
     interactive_dir : str
@@ -302,6 +304,8 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
         {chr(10) + "        ".join(variant_options)}
         <span class="meta" style="margin-left: 12px;">({smooth_method}, poly {smooth_polyorder}; raw is the truth)</span>
     </div>""")
+    if source_file:
+        html_parts.append(f'    <p class="meta">Source dataset: <code>{source_file}</code></p>')
     html_parts.append("    <p>Every extracted event window, per channel. "
                       "x-axis is absolute recording time (s); the red dotted "
                       "lines mark the window min/max voltage; the dashed line "
@@ -393,6 +397,7 @@ def gen_spike_waveform_html(results: Dict[int, Dict[str, Any]],
 
 def gen_channel_html(results: Dict[int, Dict[str, Any]],
                      output_file: str, raw_data: np.ndarray,
+                     source_file: str = "",
                      ds_factor: int = CHANNEL_DS_FACTOR,
                      sample_rate: int = 30000,
                      voltage_scale: float = 0.195,
@@ -415,6 +420,8 @@ def gen_channel_html(results: Dict[int, Dict[str, Any]],
         Path to write the HTML overview file.
     raw_data : np.ndarray
         Raw int16 array of shape (T, 64) from load_raw_data().
+    source_file : str
+        Path to the original raw dataset (displayed at the top of the page).
     ds_factor : int
         Decimation factor for the trace PNGs.
     sample_rate : int
@@ -430,6 +437,8 @@ def gen_channel_html(results: Dict[int, Dict[str, Any]],
     """
     print(f"\nGenerating full-trace HTML: {output_file}")
     html_parts = _html_head("MEA Channel Traces")
+    if source_file:
+        html_parts.append(f'    <p class="meta">Source dataset: <code>{source_file}</code></p>')
     html_parts.append("    <p>Full recording per channel with detected "
                       "events marked (envelope and spike gates shown dashed).</p>")
 
@@ -498,7 +507,7 @@ def gen_channel_interactive_html(results: Dict[int, Dict[str, Any]],
                                  overview_ds: int = INTERACTIVE_OVERVIEW_DS,
                                  spike_ds: int = INTERACTIVE_SPIKE_DS,
                                  context_ms: float = SPIKE_CONTEXT_MS,
-                                 plotly_js: str = PLOTLY_JS,
+                                 plotly_js: str = "cdn",
                                  sample_rate: int = 30000,
                                  event_gate_scale: float = 5.0,
                                  spike_gate_scale: float = 5.0) -> None:
@@ -664,10 +673,12 @@ def write_output_index(output_path: Path, output_root: Path,
     """Regenerate the static entry-point index.html for all runs.
 
     Writes `output_path/index.html` with relative links to every archived
-    run's waveform grid, all-channels view, and run metadata. The newest
-    run is listed first. Called at the end of every run (fresh extraction
-    and -v re-render) so the latest pages are always one click away from
-    the index opened from disk -- plain relative links, no server or JS.
+    run's waveform grid, all-channels view, and run metadata. Each run
+    entry includes the source dataset filepath read from run_meta.json.
+    The newest run is listed first. Called at the end of every run (fresh
+    extraction and -v re-render) so the latest pages are always one click
+    away from the index opened from disk -- plain relative links, no server
+    or JS.
 
     Parameters
     ----------
@@ -698,15 +709,30 @@ def write_output_index(output_path: Path, output_root: Path,
         return (datetime.datetime.strptime(run_name, timestamp_format)
                 .strftime("%Y-%m-%d %H:%M:%S"))
 
+    def read_source_file(run_dir: Path) -> Optional[str]:
+        meta_path = run_dir / run_meta_filename
+        if not meta_path.exists():
+            return None
+        try:
+            import json
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            return meta.get("source_file")
+        except Exception:
+            return None
+
     latest_section = ""
     if latest is not None:
         latest_grid = run_link(latest, "html/waveforms_grid.html")
         latest_channels = run_link(latest, "html/all_ch_spikes.html")
         latest_meta = run_link(latest, run_meta_filename)
+        latest_source = read_source_file(latest)
+        source_line = f'<p class="meta">Source: <code>{latest_source}</code></p>' if latest_source else ""
         latest_section = f"""
     <div class="panel">
         <h2>Latest run</h2>
         <p class="meta">Newest run: <strong>{format_timestamp(latest.name)}</strong></p>
+        {source_line}
         <p class="latest-links">
             <a href="{latest_grid}">Waveform grid</a>
             <a href="{latest_channels}">All channels</a>
@@ -720,11 +746,14 @@ def write_output_index(output_path: Path, output_root: Path,
         grid = run_link(run, "html/waveforms_grid.html")
         channels = run_link(run, "html/all_ch_spikes.html")
         meta = run_link(run, run_meta_filename)
+        source = read_source_file(run)
+        source_suffix = f' <span class="meta">({source})</span>' if source else ""
         run_items += (
             f'        <li>{fmt} &mdash; '
             f'<a href="{grid}">grid</a>, '
             f'<a href="{channels}">all channels</a>, '
-            f'<a href="{meta}">run_meta.json</a></li>\n')
+            f'<a href="{meta}">run_meta.json</a>'
+            f'{source_suffix}</li>\n')
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
