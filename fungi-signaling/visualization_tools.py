@@ -1,13 +1,8 @@
 """
 visualization_tools.py - HTML/PNG visualization for MEA spike waveforms.
 
-Extracted from raw_analysis.py to separate rendering from computation.
 All functions accept pre-computed data and produce HTML files or PNG images.
 No analysis or signal processing occurs here.
-
-Shared analysis constants (SAMPLE_RATE_HZ, VOLTAGE_SCALE, EVENT_GATE_SCALE,
-SPIKE_GATE_SCALE) are passed as parameters with defaults to avoid circular
-imports with raw_analysis.py.
 """
 
 from __future__ import annotations
@@ -32,8 +27,8 @@ SPIKE_WINDOWS_LIMIT: int = 50          # default # of waveform tiles shown per c
 FIGURE_DPI: int = 80                   # DPI for base64-encoded figures embedded in HTML (channel overview)
 TILE_DPI: int = 120                    # DPI for per-event grid tile PNGs (higher than overview since tiles are small)
 TRACE_DPI: int = 100                   # DPI for full-trace channel overview PNGs
-INTERACTIVE_OVERVIEW_DS: int = 200     # decimation factor for the full-trace layer in the plotly interactive view
-INTERACTIVE_SPIKE_DS: int = 4          # decimation factor for the high-res spike context segments in the plotly view
+INTERACTIVE_OVERVIEW_DS: int = 1       # decimation factor for the full-trace layer in the plotly interactive view
+INTERACTIVE_SPIKE_DS: int = 1          # decimation factor for the high-res spike context segments in the plotly view
 SPIKE_CONTEXT_MS: float = 200.0        # ms window around each peak for the high-res context segments (used in gen_spike_waveform_html)
 INTERACTIVE_CONTEXT_MS: float = 100.0  # ms context margin for the interactive deep-link zoom from grid tile clicks
 INTERACTIVE_HTML_DIR: str = "interactive_ch_views"  # subdirectory under html/ for per-channel interactive files
