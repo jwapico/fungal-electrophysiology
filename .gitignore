@@ -372,3 +372,4 @@ outputs/
 fungi-signaling/outputs*
 .DS_Store
 pyrightconfig.json
+src/index.html
