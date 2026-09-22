@@ -180,10 +180,10 @@ from visualization_tools import (
 )
 
 # ---------------- dataset constants ----------------
-RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_control_0_cut800s.bin"     # https://zenodo.org/records/17588964
-# RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_0_mycelium.bin"            # https://zenodo.org/records/17633358
-# RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_3_fungicidal_.bin"            # https://zenodo.org/records/17633358
-# RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_10mM_6_cut800s.bin"     # https://zenodo.org/records/17588964
+RAW_DATA_FILE: str = "data/raw_mea_bins/recording_control_0_cut800s.bin"     # https://zenodo.org/records/17588964
+# RAW_DATA_FILE: str = "data/raw_mea_bins/recording_0_mycelium.bin"            # https://zenodo.org/records/17633358
+# RAW_DATA_FILE: str = "data/raw_mea_bins/recording_3_fungicidal_.bin"            # https://zenodo.org/records/17633358
+# RAW_DATA_FILE: str = "data/raw_mea_bins/recording_10mM_6_cut800s.bin"     # https://zenodo.org/records/17588964
 SAMPLE_RATE_HZ: int = 30000                     # 30 kHz sample rate, as described in the papers
 NUM_CHANNELS: int = 64                          # 8x8 MEA as described in the papers outline the collection of above datasets
 VOLTAGE_SCALE: float = 0.195                    # uV per int16 LSB - Intan RHD2164 downscale factor

@@ -26,7 +26,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple, TypedDict
 
 import matplotlib
 matplotlib.use("Agg")
@@ -36,6 +36,65 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
+
+
+class SideFit(TypedDict):
+    """Gaussian-mixture fit for one side of a summed CCG.
+
+    Attributes
+    ----------
+    k : int
+        Number of fitted Gaussians.
+    params : np.ndarray
+        Flat parameter vector
+        [amp_0, mu_0, sigma_0, ..., baseline].
+    bic : float
+        BIC of the best fit.
+    rss : float
+        Residual sum of squares.
+    amplitudes : np.ndarray
+        (k,) amplitudes.
+    mus : np.ndarray
+        (k,) centres in ms.
+    sigmas : np.ndarray
+        (k,) standard deviations in ms.
+    baseline : float
+        Flat baseline level.
+    fitted : np.ndarray
+        Model curve at ALL bin centres.
+    """
+    k: int
+    params: np.ndarray
+    bic: float
+    rss: float
+    amplitudes: np.ndarray
+    mus: np.ndarray
+    sigmas: np.ndarray
+    baseline: float
+    fitted: np.ndarray
+
+
+class ChannelFit(TypedDict):
+    """Per-channel fit results plus the macro-resolution histogram.
+
+    Attributes
+    ----------
+    pos : SideFit
+        Fit on the positive-lag side.
+    neg : SideFit
+        Fit on the negative-lag side.
+    macro_centers : np.ndarray
+        Working bin centres.
+    macro_counts : np.ndarray
+        Rebinned counts.
+    macro_smooth : np.ndarray
+        Smoothed counts.
+    """
+    pos: SideFit
+    neg: SideFit
+    macro_centers: np.ndarray
+    macro_counts: np.ndarray
+    macro_smooth: np.ndarray
 
 # ======================================================================
 #  TUNABLE CONSTANTS  (edit these; everything else is derived)
@@ -175,7 +234,7 @@ def _detect_peaks(counts: np.ndarray, centers: np.ndarray,
 
 def fit_side(counts: np.ndarray, centers: np.ndarray,
              bin_width_ms: float,
-             dead_zone_mask: Optional[np.ndarray] = None) -> Dict[str, object]:
+             dead_zone_mask: Optional[np.ndarray] = None) -> SideFit:
     """Fit Gaussians to one half of the CCG (+ or - lag side).
 
     Parameters
@@ -192,7 +251,7 @@ def fit_side(counts: np.ndarray, centers: np.ndarray,
 
     Returns
     -------
-    Dict with keys:
+    SideFit keys:
         k         int           number of fitted Gaussians
         params    np.ndarray    flat parameter vector
         bic       float         BIC of the best fit
@@ -211,10 +270,9 @@ def fit_side(counts: np.ndarray, centers: np.ndarray,
                 "sigmas": np.array([]), "baseline": 0.0,
                 "fitted": np.zeros(n)}
 
-    if dead_zone_mask is None:
-        dead_zone_mask = np.zeros(n, dtype=bool)
+    dz = (np.zeros(n, dtype=bool) if dead_zone_mask is None else dead_zone_mask)
 
-    fit_mask = ~dead_zone_mask
+    fit_mask = ~dz
     fit_counts = counts[fit_mask]
     fit_centers = centers[fit_mask]
     n_fit = int(fit_mask.sum())
@@ -230,7 +288,7 @@ def fit_side(counts: np.ndarray, centers: np.ndarray,
     peak_idx = _detect_peaks(fit_counts, fit_centers, bin_width_ms)
     n_peaks = max(len(peak_idx), 1)
 
-    best_result: Optional[Dict[str, object]] = None
+    best_result: Optional[SideFit] = None
 
     for k in range(n_peaks, min(n_peaks + 3, MAX_K + 1)):
         x0 = _initial_guesses(fit_centers, peak_idx, fit_counts, baseline, k)
@@ -275,9 +333,11 @@ def fit_side(counts: np.ndarray, centers: np.ndarray,
 
         fitted_all = gaussian_model(centers, *res.x)
 
-        candidate = {"k": k, "params": res.x, "bic": bic_val, "rss": rss,
-                     "amplitudes": amplitudes, "mus": mus, "sigmas": sigmas,
-                     "baseline": bl, "fitted": fitted_all}
+        candidate: SideFit = {
+            "k": k, "params": res.x, "bic": bic_val, "rss": rss,
+            "amplitudes": amplitudes, "mus": mus, "sigmas": sigmas,
+            "baseline": bl, "fitted": fitted_all,
+        }
 
         if best_result is None or bic_val < best_result["bic"]:
             best_result = candidate
@@ -298,7 +358,7 @@ def fit_side(counts: np.ndarray, centers: np.ndarray,
 
 
 def fit_channel(ccg_fine: np.ndarray, fine_centers: np.ndarray,
-                macro_bin_ms: float) -> Dict[str, object]:
+                macro_bin_ms: float) -> ChannelFit:
     """Rebin, smooth, fit each side independently, return results.
 
     Parameters
@@ -312,11 +372,11 @@ def fit_channel(ccg_fine: np.ndarray, fine_centers: np.ndarray,
 
     Returns
     -------
-    Dict with keys:
-        pos / neg   each the dict from fit_side()
-        macro_centers  np.ndarray  working bin centres
-        macro_counts   np.ndarray  rebinned counts
-        macro_smooth   np.ndarray  smoothed counts
+    ChannelFit keys:
+        pos / neg       SideFit  one per lag side
+        macro_centers   np.ndarray  working bin centres
+        macro_counts    np.ndarray  rebinned counts
+        macro_smooth    np.ndarray  smoothed counts
     """
     lo = float(fine_centers.min()) - macro_bin_ms
     hi = float(fine_centers.max()) + macro_bin_ms
@@ -350,7 +410,7 @@ def fit_channel(ccg_fine: np.ndarray, fine_centers: np.ndarray,
 
 
 def _build_figure(channel: int, n_spikes: int,
-                  fit_data: Dict[str, object]) -> Figure:
+                  fit_data: ChannelFit) -> Figure:
     """Build the single-panel matplotlib figure for a channel (no output side-effects).
 
     Renders the summed CCG at ±ZOOM_XRANGE_MS with confidence-interval
@@ -433,7 +493,7 @@ def _build_figure(channel: int, n_spikes: int,
 
 
 def _plot_channel(channel: int, n_spikes: int,
-                  fit_data: Dict[str, object],
+                  fit_data: ChannelFit,
                   output_path: Path) -> None:
     """Render the channel figure to a PNG overlay file.
 
@@ -443,14 +503,14 @@ def _plot_channel(channel: int, n_spikes: int,
         Channel index.
     n_spikes : int
         Number of spikes on the channel.
-    fit_data : Dict[str, object]
+    fit_data : ChannelFit
         Fit result from fit_channel.
     output_path : Path
         Destination .png path.
     """
     fig = _build_figure(channel, n_spikes, fit_data)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=100)
+    fig.savefig(str(output_path), dpi=100)
     plt.close(fig)
 
 
