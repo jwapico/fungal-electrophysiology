@@ -371,3 +371,4 @@ package-lock.json
 outputs/
 fungi-signaling/outputs*
 .DS_Store
+pyrightconfig.json
