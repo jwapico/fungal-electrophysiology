@@ -181,7 +181,9 @@ from visualization_tools import (
 
 # ---------------- dataset constants ----------------
 RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_control_0_cut800s.bin"     # https://zenodo.org/records/17588964
-RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_0_mycelium.bin"            # https://zenodo.org/records/17633358
+# RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_0_mycelium.bin"            # https://zenodo.org/records/17633358
+# RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_3_fungicidal_.bin"            # https://zenodo.org/records/17633358
+# RAW_DATA_FILE: str = "../data/raw_mea_bins/recording_10mM_6_cut800s.bin"     # https://zenodo.org/records/17588964
 SAMPLE_RATE_HZ: int = 30000                     # 30 kHz sample rate, as described in the papers
 NUM_CHANNELS: int = 64                          # 8x8 MEA as described in the papers outline the collection of above datasets
 VOLTAGE_SCALE: float = 0.195                    # uV per int16 LSB - Intan RHD2164 downscale factor
@@ -224,13 +226,13 @@ def main(args: argparse.Namespace) -> None:
     run_dir, npz_path, grid_path, channel_path, html_dir = _resolve_run_paths(args)
     interactive_dir = html_dir / INTERACTIVE_HTML_DIR
 
-    print("=" * 120)
+    print("=" * 60)
     print("MEA Spike Waveform Pipeline (event-based)")
-    print("=" * 120)
+    print("=" * 60)
     print(f"Data file:  {args.data_file}")
     print(f"Run dir:    {run_dir}")
     print(f"Waveforms:  {npz_path}")
-    print("=" * 120)
+    print("=" * 60)
 
     raw_data = load_raw_data(args.data_file)
 
@@ -282,10 +284,10 @@ def main(args: argparse.Namespace) -> None:
     
     index_filepath = write_output_index(Path(os.path.dirname(os.path.abspath(__file__))), Path(args.out_root), TIMESTAMP_FORMAT, RUN_META_FILENAME)
 
-    print("\n" + "=" * 120)
+    print("\n" + "=" * 60)
     print("DONE!")
     print(f"Open {index_filepath} in your browser")
-    print("=" * 120)
+    print("=" * 60)
 
 
 def load_raw_data(filepath: str) -> np.ndarray:
